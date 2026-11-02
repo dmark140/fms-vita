@@ -1,27 +1,21 @@
-// app/api/admin/createUser/route.ts
-export const runtime = "nodejs";
-import { admin_db } from "@/lib/Supabase/supabaseAdmin";
-import { NextResponse } from "next/server";
+export const runtime = "nodejs"
+import { NextResponse } from "next/server"
+import { USER_TYPE, adminAccessError, requireAdminActor } from "@/lib/auth/adminAccess"
+import { createRegistrationAccount, RegistrationError } from "@/lib/data/repositories/registration.server"
+import { normalizeUserFmsTypes } from "@/lib/auth/fmsAccess"
 
 export async function POST(req: Request) {
   try {
-    const { email, password } = await req.json();
-    const { data, error } = await admin_db.auth.admin.createUser({
-      email,
-      password,
-      email_confirm: true,  
-    });
-
-    if (error) {
-      return NextResponse.json({ error: error.message }, { status: 400 });
-    }
-    return NextResponse.json({ user: data.user }, { status: 200 });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  } catch (err: any) {
-    console.error("API Error:", err);
-    return NextResponse.json(
-      { error: "Internal Server Error", details: err.message },
-      { status: 500 }
-    );
+    const actor = await requireAdminActor(req)
+    const input = await req.json()
+    if (!input || typeof input !== "object" || Array.isArray(input)) throw new RegistrationError("Invalid account details.")
+    const user = await createRegistrationAccount(input, {
+      authId: actor.auth_id,
+      fmsTypes: actor.user_type === USER_TYPE.ADMIN ? normalizeUserFmsTypes(actor.fms_types, actor.fms_type) : [],
+    })
+    return NextResponse.json({ user })
+  } catch (error) {
+    const response = error instanceof RegistrationError ? { status: error.status, message: error.message } : adminAccessError(error)
+    return NextResponse.json({ error: response.message }, { status: response.status })
   }
 }

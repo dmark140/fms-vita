@@ -14,6 +14,8 @@ export type DispatchDoc = {
   dr_no: string;
 
   farm_name: string;
+  destination_farm_id: number | null;
+  destination_farm_code: string | null;
   address: string | null;
   hauler_name: string | null;
   hauler_plate_no: string | null;
@@ -24,6 +26,10 @@ export type DispatchDoc = {
 
   remarks: string | null;
   is_active: boolean;
+  status: "Draft" | "Posted";
+  posted_at: string | null;
+  posted_by: string | null;
+  posting_version: number;
 };
 
 export type DispatchDocItem = {
@@ -52,6 +58,7 @@ export type DispatchDocUpsertPayload = {
   doc_date: string;
   dr_no: string;
   farm_name: string;
+  destination_farm_code: string;
   address: string | null;
   hauler_name: string | null;
   hauler_plate_no: string | null;
@@ -76,7 +83,7 @@ async function getRequiredAccessToken() {
 }
 
 async function requestDocDispatchWrite<T>(
-  method: "POST" | "PUT" | "DELETE",
+  method: "POST" | "PUT" | "PATCH" | "DELETE",
   body: unknown,
 ): Promise<T> {
   const token = await getRequiredAccessToken();
@@ -98,17 +105,57 @@ async function requestDocDispatchWrite<T>(
   return json as T;
 }
 
-export async function listDispatchDocs() {
+export type DispatchDocListRow = Partial<DispatchDoc> & {
+  hatchery_farm_id: number | null;
+  hatchery_farm_ids: number[];
+};
+
+export async function listDispatchDocs(): Promise<DispatchDocListRow[]> {
   const { data, error } = await db
     .from("dispatch_doc")
     .select(
-      "id, doc_date, dr_no, farm_name, hauler_name, hauler_plate_no, truck_seal_no, chick_van_temp_c, number_of_fans, remarks, is_active, created_at",
+      "id, doc_date, dr_no, farm_name, destination_farm_id, destination_farm_code, hauler_name, hauler_plate_no, truck_seal_no, chick_van_temp_c, number_of_fans, remarks, is_active, status, posted_at, posting_version, created_at, created_by",
     )
     .eq("is_active", true)
     .order("created_at", { ascending: false });
 
   if (error) throw error;
-  return (data ?? []) as Partial<DispatchDoc>[];
+  const headers = (data ?? []) as Partial<DispatchDoc>[];
+  const documentIds = headers.flatMap((row) => Number.isInteger(Number(row.id)) ? [Number(row.id)] : []);
+  if (!documentIds.length) return [];
+
+  const { data: itemRows, error: itemError } = await db
+    .from("dispatch_doc_item")
+    .select("dispatch_doc_id, doc_batch_code")
+    .in("dispatch_doc_id", documentIds);
+  if (itemError) throw itemError;
+
+  const batchCodes = Array.from(new Set(
+    (itemRows ?? []).map((row) => String(row.doc_batch_code ?? "").trim()).filter(Boolean),
+  ));
+  const { data: gradingRows, error: gradingError } = batchCodes.length
+    ? await db.from("chick_grading_process").select("batch_code, farm_id").in("batch_code", batchCodes)
+    : { data: [], error: null };
+  if (gradingError) throw gradingError;
+
+  const farmIdByBatch = new Map(
+    (gradingRows ?? []).map((row) => [String(row.batch_code ?? "").trim(), Number(row.farm_id) || null]),
+  );
+  const farmIdsByDocument = new Map<number, Set<number>>();
+  for (const row of itemRows ?? []) {
+    const farmId = farmIdByBatch.get(String(row.doc_batch_code ?? "").trim());
+    if (!farmId) continue;
+    const documentId = Number(row.dispatch_doc_id);
+    const farmIds = farmIdsByDocument.get(documentId) ?? new Set<number>();
+    farmIds.add(farmId);
+    farmIdsByDocument.set(documentId, farmIds);
+  }
+
+  return headers.map((row) => {
+    const farmIds = farmIdsByDocument.get(Number(row.id)) ?? new Set<number>();
+    const hatcheryFarmIds = [...farmIds].sort((left, right) => left - right);
+    return { ...row, hatchery_farm_id: hatcheryFarmIds.length === 1 ? hatcheryFarmIds[0] : null, hatchery_farm_ids: hatcheryFarmIds };
+  });
 }
 
 export async function getDispatchDocById(id: number) {
@@ -149,6 +196,10 @@ export async function updateDispatchDoc(
   payload: DispatchDocUpsertPayload,
 ) {
   await requestDocDispatchWrite("PUT", { id, payload });
+}
+
+export async function postDispatchDoc(id: number) {
+  await requestDocDispatchWrite("PATCH", { id });
 }
 
 export async function softDeleteDispatchDoc(id: number) {
@@ -253,23 +304,4 @@ export async function getChickGradingQtyByBatchCode(batch_code: string) {
 
   if (error) throw error;
   return (data ?? null) as ChickGradingQtyRow | null;
-}
-export type BoilerFarmOption = {
-  boiler_name: string;
-  address: string | null;
-};
-
-export async function listBoilerFarmOptions(): Promise<BoilerFarmOption[]> {
-  const { data, error } = await db
-    .from("boiler_masterdata")
-    .select("boiler_name, address")
-    .eq("is_active", true)
-    .order("boiler_name", { ascending: true });
-
-  if (error) throw error;
-
-  return ((data ?? []) as BoilerFarmOption[]).map((row) => ({
-    boiler_name: row.boiler_name ?? "",
-    address: row.address ?? "",
-  }));
 }

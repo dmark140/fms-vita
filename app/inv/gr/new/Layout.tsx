@@ -1,110 +1,183 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type ClipboardEvent } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import {
-  ArrowDownUp,
-  CalendarDays,
-  ClipboardClock,
+  FileSpreadsheet,
+  FileUp,
+  Hash,
   List,
+  Loader2,
+  PackageCheck,
   Plus,
   Save,
   Trash2,
 } from 'lucide-react'
 import { toast } from 'sonner'
+import readXlsxFile from 'read-excel-file/browser'
 
 import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
+import BatchTransactionTimeline from '@/components/inventory/BatchTransactionTimeline'
+import BatchWarehouseReportButton from '@/components/inventory/BatchWarehouseReportButton'
 import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { FormTable, FormTableFooter } from '@/components/ui/form-table'
+import { PageActionBar, PageHeader, PageHeaderActions, PageSection, PageShell } from '@/components/ui/page-layout'
+import SearchableCombobox from '@/components/SearchableCombobox'
 import SearchableDropdown from '@/lib/SearchableDropdown'
-import { Farms, Items, WarehouseData } from '@/lib/types'
+import Breadcrumb from '@/lib/Breadcrumb'
+import { useSyncDefaultFarm } from '@/lib/farms/useDefaultFarmSelection'
+import { useGlobalContext } from '@/lib/context/GlobalContext'
+import { useSidebar } from '@/lib/sidebar/SidebarProvider'
+import { Items, WarehouseData } from '@/lib/types'
+import { getInventoryStatusBadgeClass } from '@/app/inv/statusStyles'
 import {
   createGoodsReceiptNumber,
-  getGoodsReceipts,
+  getGoodsReceiptById,
   GoodsReceipt,
   GoodsReceiptLine,
   saveGoodsReceipt,
 } from '../api'
 import {
+  findExistingItemBatch,
+  GoodsReceiptBatchRule,
+  GoodsReceiptBatchSeries,
+  GoodsReceiptExistingBatch,
   getGoodsReceiptReferences,
+  GoodsReceiptFarm,
+  GoodsReceiptItemGroup,
   UomConversionOption,
   UomGroupOption,
 } from './api'
+import {
+  getBatchTransactionTrail,
+  type BatchTransactionTrail,
+} from '@/lib/data/repositories/batchTransactionTrail'
+import GoodsReceiveLoadingShell from './GoodsReceiveLoadingShell'
+import BatchDetailsDialog from './BatchDetailsDialog'
+import PostGoodsReceiptDialog from './PostGoodsReceiptDialog'
+import { GOODS_RECEIPT_LINE_HEADERS, parseGoodsReceiptLinesImport, parseGoodsReceiptLinesText } from './goodsReceiptLinesImport'
+import { exportGoodsReceiptLinesTemplate } from './goodsReceiptLinesTemplate'
+import {
+  FMS_TYPE_OPTIONS,
+  addMonthsToDate,
+  buildBatchNumber,
+  duplicateReceipt,
+  emptyReceipt,
+  formatBatchDatePart,
+  formatQuantity,
+  getAssociatedWarehouseCode,
+  getDefaultReceivingWarehouse,
+  getFarmFmsType,
+  getItemDescription,
+  getItemFmsType,
+  getWarehouseFmsType,
+  getWarehousesForFarm,
+  isDocItem,
+  newLine,
+  numberValue,
+  type GoodsReceiveFormMode,
+} from './formUtils'
 
-const today = () => {
-  const date = new Date()
-  const offset = date.getTimezoneOffset()
-  return new Date(date.getTime() - offset * 60_000).toISOString().slice(0, 10)
+type NewGoodsReceiveProps = {
+  mode?: GoodsReceiveFormMode
 }
 
-const newLine = (): GoodsReceiptLine => ({
-  id: crypto.randomUUID(),
-  itemId: null,
-  itemCode: '',
-  description: '',
-  altQty: 1,
-  altUom: '',
-  baseQty: 1,
-  baseUom: '',
-  warehouseId: null,
-  warehouseCode: '',
-  warehouseName: '',
-  returnedQty: 0,
-})
-
-const emptyReceipt = (): GoodsReceipt => ({
-  id: crypto.randomUUID(),
-  grNo: createGoodsReceiptNumber(),
-  vendor: '',
-  receiveDate: today(),
-  farmId: null,
-  farmCode: '',
-  farmName: '',
-  defaultWarehouseId: null,
-  status: 'Draft',
-  lines: Array.from({ length: 5 }, newLine),
-  createdAt: new Date().toISOString(),
-})
-
-const numberValue = (value: string) => {
-  const parsed = Number(value)
-  return Number.isFinite(parsed) ? parsed : 0
-}
-
-export default function NewGoodsReceive() {
+export default function NewGoodsReceive({ mode = 'draft' }: NewGoodsReceiveProps) {
   const router = useRouter()
   const searchParams = useSearchParams()
+  const { setCollapsed } = useSidebar()
+  const { getValue } = useGlobalContext()
   const receiptId = searchParams.get('id')
+  const duplicateId = searchParams.get('duplicateId')
+  const isPostMode = mode === 'post'
   const [receipt, setReceipt] = useState<GoodsReceipt | null>(null)
+  useSyncDefaultFarm(receipt?.farmId)
   const [items, setItems] = useState<Items[]>([])
   const [warehouses, setWarehouses] = useState<WarehouseData[]>([])
-  const [farms, setFarms] = useState<Farms[]>([])
+  const [farms, setFarms] = useState<GoodsReceiptFarm[]>([])
   const [uomGroups, setUomGroups] = useState<UomGroupOption[]>([])
   const [conversions, setConversions] = useState<UomConversionOption[]>([])
+  const [itemGroups, setItemGroups] = useState<GoodsReceiptItemGroup[]>([])
+  const [batchRules, setBatchRules] = useState<GoodsReceiptBatchRule[]>([])
+  const [batchSeries, setBatchSeries] = useState<GoodsReceiptBatchSeries[]>([])
+  const [activeBatchLineId, setActiveBatchLineId] = useState<GoodsReceiptLine['id'] | null>(null)
+  const manufacturingDateInputRef = useRef<HTMLInputElement>(null)
+  const quantityInputRefs = useRef(new Map<string, HTMLInputElement>())
+  const pendingQuantityFocusLineId = useRef<string | null>(null)
+  const goodsReceiptLinesImportInputRef = useRef<HTMLInputElement>(null)
+  const [batchTrailRows, setBatchTrailRows] = useState<BatchTransactionTrail[]>([])
+  const [loadingBatchTrail, setLoadingBatchTrail] = useState(false)
+  const [batchTrailError, setBatchTrailError] = useState('')
+  const [batchTrailRetry, setBatchTrailRetry] = useState(0)
+  const [batchMatches, setBatchMatches] = useState<Record<string, GoodsReceiptExistingBatch | null>>({})
+  const [postConfirmOpen, setPostConfirmOpen] = useState(false)
   const [lineCount, setLineCount] = useState(1)
   const [loadingReferences, setLoadingReferences] = useState(true)
   const [saving, setSaving] = useState(false)
+  const [pasteLinesOpen, setPasteLinesOpen] = useState(false)
+  const [pastedLinesText, setPastedLinesText] = useState('')
+  const [importingGoodsReceiptLines, setImportingGoodsReceiptLines] = useState(false)
+  const [goodsReceiptLinesImportIssues, setGoodsReceiptLinesImportIssues] = useState<string[]>([])
 
   useEffect(() => {
-    const savedReceipt = receiptId
-      ? getGoodsReceipts().find(row => row.id === receiptId)
-      : null
+    setCollapsed(true)
+  }, [setCollapsed])
 
-    setReceipt(savedReceipt ?? emptyReceipt())
+  useEffect(() => {
+    let cancelled = false
 
-    getGoodsReceiptReferences()
-      .then(data => {
-        setItems(data.items)
-        setWarehouses(data.warehouses)
-        setFarms(data.farms)
-        setUomGroups(data.uomGroups)
-        setConversions(data.conversions)
-      })
-      .catch(error => {
+    async function loadPageData() {
+      try {
+        if (isPostMode && !receiptId) {
+          toast('Select a draft goods receipt to post.')
+          router.push('/inv/gr')
+          return
+        }
+
+        // UoM defaults are editable master data. The persisted global cache
+        // can outlive an edit (or deployment), so load current references here.
+        const referencesPromise = getGoodsReceiptReferences()
+
+        const [references, savedReceipt, grNo] = await Promise.all([
+          referencesPromise,
+          receiptId
+            ? getGoodsReceiptById(Number(receiptId))
+            : duplicateId
+              ? getGoodsReceiptById(Number(duplicateId))
+              : Promise.resolve(null),
+          receiptId && !duplicateId ? Promise.resolve('') : createGoodsReceiptNumber(),
+        ])
+
+        if (cancelled) return
+
+        setReceipt(duplicateId && savedReceipt
+          ? duplicateReceipt(savedReceipt, grNo)
+          : savedReceipt ?? emptyReceipt(grNo))
+        setItems(references.items)
+        setWarehouses(references.warehouses)
+        setFarms(references.farms)
+        setUomGroups(references.uomGroups)
+        setConversions(references.conversions)
+        setItemGroups(references.itemGroups)
+        setBatchRules(references.batchRules)
+        setBatchSeries(references.batchSeries)
+      } catch (error) {
         console.error(error)
         toast('Reference data could not be loaded.')
-      })
-      .finally(() => setLoadingReferences(false))
-  }, [receiptId])
+      } finally {
+        if (!cancelled) setLoadingReferences(false)
+      }
+    }
+
+    loadPageData()
+
+    return () => {
+      cancelled = true
+    }
+  }, [duplicateId, isPostMode, receiptId, router])
 
   const totalQuantity = useMemo(
     () => receipt?.lines.reduce(
@@ -114,13 +187,287 @@ export default function NewGoodsReceive() {
     [receipt],
   )
 
-  if (!receipt) return null
+  const selectedFarm = useMemo(
+    () => farms.find(farm => farm.id === receipt?.farmId),
+    [farms, receipt?.farmId],
+  )
 
-  const updateLine = (id: string, changes: Partial<GoodsReceiptLine>) => {
+  const farmWarehouses = useMemo(
+    () => getWarehousesForFarm(selectedFarm, warehouses),
+    [selectedFarm, warehouses],
+  )
+
+  const farmOptions = useMemo(
+    () => farms.map(farm => ({
+      code: String(farm.id),
+      name: farm.code ? `${farm.code} - ${farm.name}` : farm.name || String(farm.id),
+    })),
+    [farms],
+  )
+
+  const availableItems = useMemo(() => {
+    const fmsType = String(receipt?.fmsType ?? '').trim().toLowerCase()
+    if (!fmsType) return []
+
+    return items.filter(item => getItemFmsType(item) === fmsType && !isDocItem(item))
+  }, [items, receipt?.fmsType])
+
+  const itemDropdownOptions = useMemo(
+    () => availableItems.map(item => ({
+      ...item,
+      itemDisplayDescription: getItemDescription(item),
+    })),
+    [availableItems],
+  )
+
+  const itemGroupIdByCode = useMemo(() => {
+    const map = new Map<string, number>()
+
+    itemGroups.forEach(group => {
+      const code = String(group.code ?? '').trim().toUpperCase()
+      if (code) map.set(code, group.id)
+    })
+
+    return map
+  }, [itemGroups])
+
+  useEffect(() => {
+    if (loadingReferences || !receipt?.farmId) return
+
+    const allowedCodes = new Set(
+      farmWarehouses.map(warehouse => String(warehouse.whse_code ?? '').trim())
+    )
+    const currentDefaultWarehouse = receipt.defaultWarehouseId == null
+      ? null
+      : farmWarehouses.find(warehouse => warehouse.id === receipt.defaultWarehouseId) ?? null
+    // The farm receiving warehouse is an initial fallback only. Once a user
+    // selects a valid warehouse for this receipt, preserve that choice.
+    const defaultWarehouse = getDefaultReceivingWarehouse(selectedFarm, farmWarehouses)
+    const nextDefaultWarehouse = currentDefaultWarehouse ?? defaultWarehouse
+    const nextDefaultWarehouseId = nextDefaultWarehouse?.id ?? null
+    const nextFmsType = getFarmFmsType(selectedFarm) || getWarehouseFmsType(nextDefaultWarehouse)
+
+    const nextLines = receipt.lines.map(line => {
+      if (line.warehouseCode && allowedCodes.has(line.warehouseCode)) return line
+      if (!line.warehouseCode && !nextDefaultWarehouse) return line
+
+      return {
+        ...line,
+        warehouseId: nextDefaultWarehouse?.id ?? null,
+        warehouseCode: nextDefaultWarehouse?.whse_code ?? '',
+        warehouseName: nextDefaultWarehouse?.whse_name ?? '',
+      }
+    })
+
+    const linesChanged = nextLines.some((line, index) => line !== receipt.lines[index])
+    const defaultWarehouseChanged = receipt.defaultWarehouseId !== nextDefaultWarehouseId
+    const fmsTypeChanged = Boolean(nextFmsType) && receipt.fmsType !== nextFmsType
+
+    if (!defaultWarehouseChanged && !fmsTypeChanged && !linesChanged) return
+
+    setReceipt(current => current ? {
+      ...current,
+      fmsType: nextFmsType || current.fmsType,
+      defaultWarehouseId: nextDefaultWarehouseId,
+      lines: nextLines,
+    } : current)
+  }, [farmWarehouses, loadingReferences, receipt?.defaultWarehouseId, receipt?.farmId, receipt?.fmsType, receipt?.lines, selectedFarm])
+
+  useEffect(() => {
+    if (loadingReferences || receipt?.farmId || farms.length === 0) return
+
+    const defaultFarmReference = getValue('DefaultFarmId')
+      ?? getValue('UserInfoAuthSession')?.[0]?.default_farm
+    const farm = farms.find(candidate =>
+      String(candidate.id) === String(defaultFarmReference ?? '')
+      || candidate.code === String(defaultFarmReference ?? ''),
+    )
+    if (!farm) return
+    const availableFarmWarehouses = getWarehousesForFarm(farm, warehouses)
+    const defaultWarehouse = getDefaultReceivingWarehouse(farm, availableFarmWarehouses)
+    const allowedCodes = new Set(
+      (farm.associated_warehouses ?? [])
+        .map(getAssociatedWarehouseCode)
+        .filter(Boolean)
+    )
+
+    setReceipt(current => {
+      if (!current || current.farmId) return current
+
+      return {
+        ...current,
+        farmId: farm.id,
+        farmCode: farm.code,
+        farmName: farm.name ?? '',
+        fmsType: getFarmFmsType(farm) || getWarehouseFmsType(defaultWarehouse),
+        defaultWarehouseId: defaultWarehouse?.id ?? null,
+        lines: current.lines.map(line =>
+          allowedCodes.has(line.warehouseCode)
+            ? line
+            : {
+              ...line,
+              warehouseId: defaultWarehouse?.id ?? null,
+              warehouseCode: defaultWarehouse?.whse_code ?? '',
+              warehouseName: defaultWarehouse?.whse_name ?? '',
+            }
+        ),
+      }
+    })
+  }, [farms, getValue, loadingReferences, receipt?.farmId, warehouses])
+
+  useEffect(() => {
+    const fmsType = String(receipt?.fmsType ?? '').trim().toLowerCase()
+    if (!fmsType || !receipt?.lines.length) return
+
+    const allowedItemCodes = new Set(
+      availableItems
+        .map(item => String(item.item_code ?? '').trim())
+        .filter(Boolean)
+    )
+
+    const nextLines = receipt.lines.map(line =>
+      !line.itemCode || allowedItemCodes.has(line.itemCode)
+        ? line
+        : {
+          ...line,
+          itemId: null,
+          itemCode: '',
+          description: '',
+          batchRuleId: null,
+          batchNumber: '',
+          supplierBatchNumber: '',
+          manufacturingDate: '',
+          expiryDate: '',
+          altUom: '',
+          baseUom: '',
+        }
+    )
+
+    if (nextLines.every((line, index) => line === receipt.lines[index])) return
+
+    setReceipt(current => current ? {
+      ...current,
+      lines: nextLines,
+    } : current)
+  }, [availableItems, receipt?.fmsType, receipt?.lines])
+
+  const batchLineForLookup = receipt?.lines.find(line => line.id === activeBatchLineId) ?? null
+  const batchTrailItemCode = batchLineForLookup?.itemCode.trim() ?? ''
+  const batchTrailNumber = batchLineForLookup?.batchNumber.trim() ?? ''
+
+  const batchLookupLines = JSON.stringify((receipt?.lines ?? []).map(line => ({
+    id: line.id,
+    itemCode: line.itemCode,
+    manufacturingDate: line.manufacturingDate,
+    expiryDate: line.expiryDate,
+  })))
+
+  useEffect(() => {
+    const lines: Pick<GoodsReceiptLine, 'id' | 'itemCode' | 'manufacturingDate' | 'expiryDate'>[] = JSON.parse(batchLookupLines)
+    let cancelled = false
+    setBatchMatches({})
+
+    const lookups = new Map<string, ReturnType<typeof findExistingItemBatch>>()
+    for (const line of lines) {
+      if (!line.itemCode || !line.manufacturingDate) continue
+      const key = JSON.stringify([line.itemCode, line.manufacturingDate, line.expiryDate])
+      let lookup = lookups.get(key)
+      if (!lookup) {
+        lookup = findExistingItemBatch(line.itemCode, line.manufacturingDate, line.expiryDate)
+        lookups.set(key, lookup)
+      }
+      void lookup.then(existingBatch => {
+        if (cancelled) return
+        setBatchMatches(current => ({ ...current, [String(line.id)]: existingBatch }))
+        if (existingBatch?.batch_number) {
+          setReceipt(current => current ? {
+            ...current,
+            lines: current.lines.map(candidate =>
+              candidate.id === line.id && candidate.batchNumber !== existingBatch.batch_number
+                ? { ...candidate, batchNumber: existingBatch.batch_number }
+                : candidate
+            ),
+          } : current)
+        }
+      }).catch(error => {
+        console.error(error)
+      })
+    }
+
+    return () => { cancelled = true }
+  }, [batchLookupLines])
+
+  useEffect(() => {
+    if (!activeBatchLineId || !batchTrailItemCode || !batchTrailNumber) {
+      setBatchTrailRows([])
+      setLoadingBatchTrail(false)
+      setBatchTrailError('')
+      return
+    }
+
+    let cancelled = false
+    setLoadingBatchTrail(true)
+    setBatchTrailRows([])
+    setBatchTrailError('')
+
+    getBatchTransactionTrail(
+      batchTrailItemCode,
+      batchTrailNumber,
+    )
+      .then(rows => {
+        if (!cancelled) setBatchTrailRows(rows)
+      })
+      .catch(error => {
+        console.error(error)
+        if (!cancelled) {
+          setBatchTrailRows([])
+          setBatchTrailError('Unable to load batch trail.')
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingBatchTrail(false)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [activeBatchLineId, batchTrailItemCode, batchTrailNumber, batchTrailRetry])
+
+  if (!receipt) return <GoodsReceiveLoadingShell />
+
+  const updateLine = (id: GoodsReceiptLine['id'], changes: Partial<GoodsReceiptLine>) => {
     setReceipt(current => current
       ? { ...current, lines: current.lines.map(line => line.id === id ? { ...line, ...changes } : line) }
       : current,
     )
+  }
+
+  const pasteDrReferences = (event: ClipboardEvent<HTMLInputElement>, lineId: GoodsReceiptLine['id']) => {
+    const text = event.clipboardData.getData('text/plain')
+    if (!/[\r\n\t]/.test(text)) return
+    event.preventDefault()
+    if (receipt.status !== 'Draft' || saving) return
+
+    const references = text.replace(/\r\n?/g, '\n').split('\n')
+    // Excel ends copied ranges with a newline; it is not another row.
+    if (references[references.length - 1] === '') references.pop()
+    if (references.some(value => value.includes('\t'))) {
+      toast.error('Copy a single column of DR references, then paste into the first DR Reference cell.')
+      return
+    }
+    if (!references.length) return
+
+    setReceipt(current => {
+      if (!current || current.status !== 'Draft') return current
+      const startIndex = current.lines.findIndex(line => line.id === lineId)
+      if (startIndex < 0) return current
+      const lines = [...current.lines]
+      references.forEach((reference, offset) => {
+        const index = startIndex + offset
+        lines[index] = { ...(lines[index] ?? newLine()), drReference: reference.trim() }
+      })
+      return { ...current, lines }
+    })
   }
 
   const calculateBaseQty = (
@@ -164,45 +511,461 @@ export default function NewGoodsReceive() {
         conversion.uomCode.toUpperCase() === uomCode.toUpperCase(),
     )
 
+  const getSelectedItem = (line: GoodsReceiptLine) =>
+    items.find(item => item.id === line.itemId)
+
+  const getItemGroupId = (item: Items) => {
+    const rawGroup = String(item.item_group ?? '').trim()
+    const numericGroup = Number(rawGroup)
+
+    if (Number.isFinite(numericGroup) && numericGroup > 0) return numericGroup
+
+    return itemGroupIdByCode.get(rawGroup.toUpperCase()) ?? null
+  }
+
+  const getItemGroupDisplay = (line: GoodsReceiptLine) => {
+    const item = getSelectedItem(line)
+    const rawGroup = String(item?.item_group ?? '').trim()
+    if (!item || !rawGroup) return '-'
+
+    const groupId = getItemGroupId(item)
+    const group = groupId == null
+      ? itemGroups.find(candidate => candidate.code.trim().toUpperCase() === rawGroup.toUpperCase())
+      : itemGroups.find(candidate => candidate.id === groupId)
+
+    return group ? `${group.code} - ${group.name}` : rawGroup
+  }
+
+  const getSubItemGroupDisplay = (line: GoodsReceiptLine) => {
+    const item = getSelectedItem(line)
+    const subItemGroupId = Number(item?.sub_item_group_id ?? 0)
+    if (!item || !subItemGroupId) return 'No sub group'
+
+    const pathIds = [
+      item.sub_item_group_level_1_id,
+      item.sub_item_group_level_2_id,
+      item.sub_item_group_level_3_id,
+    ].filter((value): value is number => value != null)
+    const path = pathIds.flatMap(pathId => {
+      const group = itemGroups.find(candidate => Number(candidate.id) === Number(pathId))
+      return group ? [group] : []
+    })
+    return path.length > 0
+      ? path.map(group => `${group.code} - ${group.name}`).join(' / ')
+      : 'Sub group unavailable'
+  }
+
+  const getBatchRuleForLine = (line: GoodsReceiptLine) => {
+    const item = getSelectedItem(line)
+    if (!item) return null
+
+    const itemUsesBatch = Boolean(
+      item.manage_batch_numbers ||
+      (item.batch_management_method && item.batch_management_method !== 'NONE')
+    )
+    if (!itemUsesBatch) return null
+
+    const itemGroupId = getItemGroupId(item)
+    const matchedRules = batchRules.filter(rule => {
+      if (rule.item_id && rule.item_id !== item.id) return false
+      if (rule.warehouse_id && rule.warehouse_id !== line.warehouseId) return false
+      if (rule.branch_id && rule.branch_id !== receipt.farmId) return false
+      if (rule.item_group_id && rule.item_group_id !== itemGroupId) return false
+      return true
+    })
+
+    return matchedRules.sort((left, right) => {
+      const leftScore = Number(Boolean(left.item_id)) + Number(Boolean(left.warehouse_id)) + Number(Boolean(left.branch_id)) + Number(Boolean(left.item_group_id))
+      const rightScore = Number(Boolean(right.item_id)) + Number(Boolean(right.warehouse_id)) + Number(Boolean(right.branch_id)) + Number(Boolean(right.item_group_id))
+      return rightScore - leftScore
+    })[0] ?? null
+  }
+
+  const getBatchRequirement = (line: GoodsReceiptLine) => {
+    const item = getSelectedItem(line)
+    if (!item) return null
+
+    const itemUsesBatch = Boolean(
+      item.manage_batch_numbers ||
+      (item.batch_management_method && item.batch_management_method !== 'NONE')
+    )
+    if (!itemUsesBatch) return null
+
+    const rule = getBatchRuleForLine(line)
+
+    return {
+      rule,
+      needsBatchNumber: true,
+      needsSupplierBatch: Boolean(rule?.require_supplier_batch),
+      needsManufacturingDate: true,
+      needsExpiryDate: getBatchSeriesForRule(rule)?.include_expiry_date !== false,
+    }
+  }
+
+  const applyGoodsReceiptLinesImport = (parsed: ReturnType<typeof parseGoodsReceiptLinesImport>) => {
+    if (!canEditDraft || saving) return false
+    setGoodsReceiptLinesImportIssues([])
+    if (!receipt.farmId) {
+      setGoodsReceiptLinesImportIssues(['Select a Farm before importing Goods Receipt item lines.'])
+      return false
+    }
+    const resolvedLines = parsed.rows.map(row => {
+      const rowNumber = row.rowNumber
+      const normalizedItemCode = row.itemCode.toUpperCase()
+      const item = availableItems.find(candidate =>
+        String(candidate.item_code ?? '').trim().toUpperCase() === normalizedItemCode,
+      )
+      if (!item) {
+        parsed.issues.push(`Row ${rowNumber}: Item Code "${row.itemCode}" is not available for the selected Farm and FMS Type.`)
+        return null
+      }
+      if (item.id == null) {
+        parsed.issues.push(`Row ${rowNumber}: Item Code "${row.itemCode}" has no valid Item Master ID.`)
+        return null
+      }
+
+      const inventoryUom = item.inventory_uom || ''
+      const unitMeasure = item.unit_measure || ''
+      const selectedGroup = uomGroups.find(group =>
+        group.code.toUpperCase() === inventoryUom.toUpperCase(),
+      )
+      const selectedGroupCode = selectedGroup?.code ?? conversions.find(option =>
+        option.uomCode.toUpperCase() === unitMeasure.toUpperCase(),
+      )?.groupCode ?? ''
+      const resolvedGroup = uomGroups.find(group => group.code === selectedGroupCode)
+      const requestedAltUom = row.altUom.toUpperCase()
+      const selectedConversion = conversions.find(option =>
+        option.groupCode.toUpperCase() === selectedGroupCode.toUpperCase() &&
+        option.uomCode.toUpperCase() === requestedAltUom,
+      )
+      const altUom = row.altUom
+        ? selectedConversion?.uomCode ?? ''
+        : resolvedGroup?.defaultUomCode || resolvedGroup?.baseUomCode || unitMeasure || inventoryUom
+
+      if (!selectedGroupCode) {
+        parsed.issues.push(`Row ${rowNumber}: Item Code "${row.itemCode}" has no configured UoM group.`)
+      } else if (row.altUom && !selectedConversion) {
+        parsed.issues.push(`Row ${rowNumber}: Alt UoM "${row.altUom}" is not valid for Item Code "${row.itemCode}".`)
+      } else if (!altUom) {
+        parsed.issues.push(`Row ${rowNumber}: Item Code "${row.itemCode}" has no default Alt UoM.`)
+      }
+
+      const warehouseKey = row.warehouse.trim().toLowerCase()
+      const defaultWarehouse = farmWarehouses.find(candidate => candidate.id === receipt.defaultWarehouseId)
+      const warehouse = warehouseKey
+        ? farmWarehouses.find(candidate => [
+            candidate.whse_code,
+            candidate.whse_name,
+            `${candidate.whse_code} - ${candidate.whse_name}`,
+          ].some(value => String(value ?? '').trim().toLowerCase() === warehouseKey))
+        : defaultWarehouse
+
+      if (row.warehouse && !warehouse) {
+        parsed.issues.push(`Row ${rowNumber}: Warehouse "${row.warehouse}" was not found under the selected Farm.`)
+      }
+
+      const altQty = Number(row.altQty)
+      const expiryDate = row.expiryDate || (
+        row.manufacturingDate && typeof item.default_expiration_months === 'number'
+          ? addMonthsToDate(row.manufacturingDate, item.default_expiration_months)
+          : ''
+      )
+      const line: GoodsReceiptLine = {
+        ...newLine(),
+        itemId: item.id,
+        itemCode: item.item_code || '',
+        description: getItemDescription(item),
+        batchNumber: row.batchNumber,
+        supplierBatchNumber: row.supplierBatchNumber,
+        manufacturingDate: row.manufacturingDate,
+        expiryDate,
+        altQty,
+        altUom,
+        baseUom: selectedGroupCode,
+        baseQty: calculateBaseQty(altQty, altUom, selectedGroupCode),
+        warehouseId: warehouse?.id ?? null,
+        warehouseCode: warehouse?.whse_code ?? '',
+        warehouseName: warehouse?.whse_name ?? '',
+      }
+      const batchRequirement = getBatchRequirement(line)
+      line.batchRuleId = batchRequirement?.rule?.id ?? null
+
+      if (line.baseQty <= 0) {
+        parsed.issues.push(`Row ${rowNumber}: Item Code "${row.itemCode}" has no valid conversion for Alt UoM "${altUom}".`)
+      }
+      if (batchRequirement?.needsSupplierBatch && !line.supplierBatchNumber) {
+        parsed.issues.push(`Row ${rowNumber}: Supplier Batch Number is required for Item Code "${row.itemCode}".`)
+      }
+      if (batchRequirement?.needsManufacturingDate && !line.manufacturingDate) {
+        parsed.issues.push(`Row ${rowNumber}: Manufacturing Date is required for Item Code "${row.itemCode}".`)
+      }
+      if (batchRequirement?.needsExpiryDate && !line.expiryDate) {
+        parsed.issues.push(`Row ${rowNumber}: Expiry Date is required for Item Code "${row.itemCode}".`)
+      }
+      if (line.batchNumber && batchRequirement?.rule && !batchRequirement.rule.manual_entry) {
+        parsed.issues.push(`Row ${rowNumber}: Batch Number must be blank because Item Code "${row.itemCode}" uses automatic batch numbering.`)
+      }
+
+      return line
+    })
+
+    if (parsed.issues.length > 0) {
+      setGoodsReceiptLinesImportIssues(parsed.issues)
+      return false
+    }
+
+    const importedLines = resolvedLines.filter((line): line is GoodsReceiptLine => Boolean(line))
+    setReceipt(current => current ? { ...current, lines: [...current.lines, ...importedLines] } : current)
+    toast.success(`${importedLines.length} Goods Receipt item ${importedLines.length === 1 ? 'line' : 'lines'} imported.`)
+    return true
+  }
+
+  const handleGoodsReceiptLinesImport = async (file: File) => {
+    if (!canEditDraft || importingGoodsReceiptLines || saving) return
+    setGoodsReceiptLinesImportIssues([])
+
+    if (!receipt.farmId) {
+      setGoodsReceiptLinesImportIssues(['Select a Farm before importing Goods Receipt item lines.'])
+      if (goodsReceiptLinesImportInputRef.current) goodsReceiptLinesImportInputRef.current.value = ''
+      return
+    }
+
+    setImportingGoodsReceiptLines(true)
+    try {
+      const sheets = await readXlsxFile(file)
+      const itemLinesSheet = sheets.find(sheet => sheet.sheet.trim().toLowerCase() === 'item lines')
+      if (!itemLinesSheet) {
+        setGoodsReceiptLinesImportIssues(['The workbook must contain a worksheet named Item Lines.'])
+        return
+      }
+
+      applyGoodsReceiptLinesImport(parseGoodsReceiptLinesImport(itemLinesSheet.data))
+    } catch (error) {
+      console.error(error)
+      setGoodsReceiptLinesImportIssues(['The Excel file could not be read. Use the exported Goods Receipt item-lines template.'])
+    } finally {
+      setImportingGoodsReceiptLines(false)
+      if (goodsReceiptLinesImportInputRef.current) goodsReceiptLinesImportInputRef.current.value = ''
+    }
+  }
+
+  const getBatchSeriesForRule = (rule?: GoodsReceiptBatchRule | null) =>
+    rule?.series_id ? batchSeries.find(series => series.id === rule.series_id) ?? null : null
+
+  const getBatchKey = (line: GoodsReceiptLine) =>
+    line.itemCode && line.manufacturingDate
+      ? `${line.itemCode.trim().toUpperCase()}|${line.manufacturingDate}|${line.expiryDate || 'NO_EXP'}`
+      : ''
+
+  const getExistingLineBatch = (line: GoodsReceiptLine) => {
+    const batchKey = getBatchKey(line)
+    if (!batchKey) return null
+
+    return receipt.lines.find(candidate =>
+      candidate.id !== line.id &&
+      getBatchKey(candidate) === batchKey &&
+      candidate.batchNumber.trim()
+    ) ?? null
+  }
+
+  const getBatchNumberParts = (line: GoodsReceiptLine) => {
+    const requirement = getBatchRequirement(line)
+    const series = getBatchSeriesForRule(requirement?.rule)
+    const item = getSelectedItem(line)
+    const existingLineBatch = getExistingLineBatch(line)
+
+    const lineIndex = receipt.lines.findIndex(candidate => candidate.id === line.id)
+    const usedBatchKeys = new Set<string>()
+    receipt.lines
+      .slice(0, Math.max(0, lineIndex))
+      .forEach(candidate => {
+        const candidateBatchKey = getBatchKey(candidate)
+        if (!candidateBatchKey || usedBatchKeys.has(candidateBatchKey)) return
+
+        const candidateRule = getBatchRuleForLine(candidate)
+        const candidateSeries = getBatchSeriesForRule(candidateRule)
+
+        if (series) {
+          if (candidateSeries?.id === series.id) usedBatchKeys.add(candidateBatchKey)
+          return
+        }
+
+        if (!candidateSeries && Boolean(getBatchRequirement(candidate))) {
+          usedBatchKeys.add(candidateBatchKey)
+        }
+      })
+
+    const seriesOffset = usedBatchKeys.size
+
+    const numberedSeries = series
+      ? { ...series, next_number: Number(series.next_number) + seriesOffset }
+      : {
+          id: 0,
+          code: 'GR',
+          name: 'Feed Stock In',
+          prefix: 'FD',
+          suffix: null,
+          separator: '-',
+          next_number: seriesOffset + 1,
+          number_length: 5,
+          date_format: 'YYMMDD' as GoodsReceiptBatchSeries['date_format'],
+          include_expiry_date: true,
+          active: true,
+        }
+
+    const dateFormat = numberedSeries.date_format
+    const sequence = String(Math.max(0, Number(numberedSeries.next_number) || 0)).padStart(
+      Math.max(1, Number(numberedSeries.number_length) || 1),
+      '0',
+    )
+    const mfgPart = formatBatchDatePart(dateFormat, line.manufacturingDate)
+    const includesExpiryDate = numberedSeries.include_expiry_date !== false
+    const expPart = includesExpiryDate ? formatBatchDatePart(dateFormat, line.expiryDate) : ''
+
+    return {
+      templateSource: series ? `${series.code} - ${series.name}` : 'GR fallback template',
+      prefix: numberedSeries.prefix ?? '',
+      mfgPart,
+      expPart,
+      sequence,
+      suffix: numberedSeries.suffix ?? '',
+      separator: numberedSeries.separator,
+      dateFormat,
+      includesExpiryDate,
+      defaultExpirationMonths: item?.default_expiration_months ?? null,
+      batchNumber: line.manufacturingDate && (!includesExpiryDate || line.expiryDate)
+        ? existingLineBatch?.batchNumber || buildBatchNumber(numberedSeries, line.manufacturingDate, line.expiryDate)
+        : '',
+      reusedFromLine: existingLineBatch,
+    }
+  }
+
+  const getGeneratedBatchNumber = (line: GoodsReceiptLine) => {
+    const requirement = getBatchRequirement(line)
+    if (!requirement || !line.manufacturingDate || (requirement.needsExpiryDate && !line.expiryDate)) return ''
+
+    return getBatchNumberParts(line).batchNumber
+  }
+
+  const openBatchDialog = (line: GoodsReceiptLine) => {
+    const requirement = getBatchRequirement(line)
+    if (!requirement) return
+
+    updateLine(line.id, {
+      batchRuleId: requirement.rule?.id ?? null,
+    })
+
+    setActiveBatchLineId(line.id)
+  }
+
+  const updateBatchLine = (line: GoodsReceiptLine, changes: Partial<GoodsReceiptLine>) => {
+    const item = getSelectedItem(line)
+    const requirement = getBatchRequirement(line)
+    const defaultExpirationMonths = item?.default_expiration_months
+    const shouldDefaultExpiry = Object.prototype.hasOwnProperty.call(changes, 'manufacturingDate') &&
+      !Object.prototype.hasOwnProperty.call(changes, 'expiryDate') &&
+      requirement?.needsExpiryDate !== false &&
+      typeof defaultExpirationMonths === 'number'
+    const defaultExpiryDate = shouldDefaultExpiry
+      ? addMonthsToDate(changes.manufacturingDate ?? '', defaultExpirationMonths)
+      : ''
+    const nextChanges = {
+      ...changes,
+      ...(shouldDefaultExpiry ? { expiryDate: defaultExpiryDate } : {}),
+    }
+    const nextLine = { ...line, ...nextChanges }
+    const generatedBatchNumber = getGeneratedBatchNumber(nextLine)
+
+    updateLine(line.id, {
+      ...nextChanges,
+      batchNumber: generatedBatchNumber,
+    })
+  }
+
+  const refreshGeneratedBatchNumber = (line: GoodsReceiptLine) => {
+    const existingBatch = batchMatches[String(line.id)]
+    if (existingBatch?.batch_number) {
+      updateLine(line.id, { batchNumber: existingBatch.batch_number })
+      return
+    }
+
+    const generatedBatchNumber = getGeneratedBatchNumber(line)
+    if (!generatedBatchNumber) {
+      toast(line.expiryDate ? 'Enter manufacturing date first.' : 'Enter required batch dates first.')
+      return
+    }
+
+    updateLine(line.id, { batchNumber: generatedBatchNumber })
+  }
+
   const selectItem = (line: GoodsReceiptLine, itemCode: string) => {
-    const item = items.find(candidate => candidate.item_code === itemCode)
+    const item = availableItems.find(candidate => candidate.item_code === itemCode)
     if (!item) {
       updateLine(line.id, {
         itemId: null,
         itemCode: '',
         description: '',
+        batchRuleId: null,
+        batchNumber: '',
+        supplierBatchNumber: '',
+        expiryDate: '',
         altUom: '',
         baseUom: '',
       })
       return
     }
 
-    const uom = item.inventory_uom || item.unit_measure || ''
-    const selectedGroupCode = conversions.find(
-      option => option.uomCode.toUpperCase() === uom.toUpperCase(),
+    const inventoryUom = item.inventory_uom || ''
+    const unitMeasure = item.unit_measure || ''
+    const selectedGroup = uomGroups.find(group => group.code.toUpperCase() === inventoryUom.toUpperCase())
+    const selectedGroupCode = selectedGroup?.code ?? conversions.find(
+      option => option.uomCode.toUpperCase() === unitMeasure.toUpperCase(),
     )?.groupCode ?? ''
-    updateLine(line.id, {
+    const resolvedGroup = uomGroups.find(group => group.code === selectedGroupCode)
+    const uom = resolvedGroup?.defaultUomCode || resolvedGroup?.baseUomCode || unitMeasure || inventoryUom
+    const nextLineChanges: Partial<GoodsReceiptLine> = {
       itemId: item.id,
       itemCode: item.item_code || '',
-      description: item.item_name || item.description || '',
+      description: getItemDescription(item),
+      batchRuleId: null,
+      batchNumber: '',
+      supplierBatchNumber: '',
+      manufacturingDate: line.manufacturingDate,
+      expiryDate: '',
       altUom: uom,
       baseUom: selectedGroupCode,
       baseQty: calculateBaseQty(line.altQty, uom, selectedGroupCode),
+    }
+    const nextLine = { ...line, ...nextLineChanges }
+    const batchRequirement = getBatchRequirement(nextLine)
+
+    if (!batchRequirement) {
+      updateLine(line.id, nextLineChanges)
+      return
+    }
+
+    updateBatchLine(nextLine, {
+      ...nextLineChanges,
+      batchRuleId: batchRequirement.rule?.id ?? null,
+      ...(batchRequirement.needsExpiryDate && typeof item.default_expiration_months === 'number'
+        ? { expiryDate: addMonthsToDate(line.manufacturingDate, item.default_expiration_months) }
+        : {}),
     })
   }
 
-  const selectWarehouse = (lineId: string, warehouseCode: string) => {
-    const warehouse = warehouses.find(candidate => candidate.whse_code === warehouseCode)
+  const selectWarehouse = (lineId: GoodsReceiptLine['id'], warehouseCode: string) => {
+    const warehouse = farmWarehouses.find(candidate => candidate.whse_code === warehouseCode)
     updateLine(lineId, {
       warehouseId: warehouse?.id ?? null,
       warehouseCode: warehouse?.whse_code ?? '',
       warehouseName: warehouse?.whse_name ?? '',
+      batchRuleId: null,
     })
   }
 
   const applyDefaultWarehouse = (warehouseId: string) => {
     const id = warehouseId ? Number(warehouseId) : null
-    const warehouse = warehouses.find(candidate => candidate.id === id)
+    const warehouse = farmWarehouses.find(candidate => candidate.id === id)
 
     setReceipt(current => current ? {
       ...current,
@@ -216,22 +979,76 @@ export default function NewGoodsReceive() {
     } : current)
   }
 
-  const handleSave = () => {
-    const completedLines = receipt.lines.filter(line => line.itemId)
+  const selectFarm = (farmId: string) => {
+    const farm = farms.find(candidate => String(candidate.id) === farmId)
+    const availableFarmWarehouses = getWarehousesForFarm(farm, warehouses)
+    const defaultWarehouse = getDefaultReceivingWarehouse(farm, availableFarmWarehouses)
+    const allowedCodes = new Set(
+      (farm?.associated_warehouses ?? [])
+        .map(getAssociatedWarehouseCode)
+        .filter(Boolean)
+    )
 
-    if (!receipt.vendor.trim()) {
+    setReceipt(current => current ? {
+      ...current,
+      farmId: farm?.id ?? null,
+      farmCode: farm?.code ?? '',
+      farmName: farm?.name ?? '',
+      fmsType: getFarmFmsType(farm) || getWarehouseFmsType(defaultWarehouse),
+      defaultWarehouseId: defaultWarehouse?.id ?? null,
+      lines: current.lines.map(line =>
+        allowedCodes.has(line.warehouseCode)
+          ? line
+          : {
+            ...line,
+            warehouseId: defaultWarehouse?.id ?? null,
+            warehouseCode: defaultWarehouse?.whse_code ?? '',
+            warehouseName: defaultWarehouse?.whse_name ?? '',
+          }
+      ),
+    } : current)
+  }
+
+  const canEditDraft = receipt.status === 'Draft'
+  const canPostDocument = receipt.status === 'Draft'
+
+  const handleSave = async (targetStatus: 'Draft' | 'Posted') => {
+    const completedLines = receipt.lines.filter(line => line.itemId)
+    const posting = targetStatus === 'Posted'
+    const completeLines = completedLines.filter(line =>
+      line.itemCode &&
+      line.baseUom &&
+      line.altUom &&
+      line.baseQty > 0 &&
+      (!posting || line.warehouseId)
+    )
+
+    if (!canEditDraft) {
+      toast('Only draft documents can be edited or posted.')
+      return
+    }
+
+    if (posting && !receipt.vendor.trim()) {
       toast('Please enter a vendor.')
       return
     }
-    if (!receipt.farmId) {
+    if (posting && completedLines.some(line => !line.drReference.trim() || !line.receiveDate)) {
+      toast('Each item needs a DR Reference and Received Date.')
+      return
+    }
+    if (posting && !receipt.fmsType) {
+      toast('Please select an FMS type.')
+      return
+    }
+    if (posting && !receipt.farmId) {
       toast('Please select a farm.')
       return
     }
-    if (completedLines.length === 0) {
+    if (posting && completedLines.length === 0) {
       toast('Please select at least one item.')
       return
     }
-    if (completedLines.some(line =>
+    if (posting && completedLines.some(line =>
       !line.warehouseId ||
       !line.baseUom ||
       !line.altUom ||
@@ -240,84 +1057,124 @@ export default function NewGoodsReceive() {
       toast('Each item needs a warehouse, UoM group, Alt UoM, and a valid conversion.')
       return
     }
+    const missingBatchLine = completedLines.find(line => {
+      const requirement = getBatchRequirement(line)
+      if (!requirement) return false
+
+      return (requirement.needsSupplierBatch && !line.supplierBatchNumber.trim()) ||
+        (requirement.needsManufacturingDate && !line.manufacturingDate) ||
+        (requirement.needsExpiryDate && !line.expiryDate)
+    })
+
+    if (posting && missingBatchLine) {
+      toast(`Please enter batch details for ${missingBatchLine.itemCode}.`)
+      return
+    }
+    if (!posting && completedLines.length !== completeLines.length) {
+      toast('Incomplete item lines are ignored when saving draft.')
+    }
 
     setSaving(true)
     try {
-      saveGoodsReceipt({
+      const savedReceipt = await saveGoodsReceipt({
         ...receipt,
-        status: 'Received',
-        lines: completedLines,
+        status: targetStatus,
+        lines: (posting ? completedLines : completeLines).map(line => ({
+          ...line,
+          batchRuleId: getBatchRuleForLine(line)?.id ?? null,
+          batchNumber: line.batchNumber.trim() || getGeneratedBatchNumber(line),
+        })),
       })
-      toast('Goods receipt saved successfully.')
-      router.push('/inv/gr')
+      toast(posting ? 'Goods receipt posted successfully.' : 'Goods receipt draft saved.')
+
+      if (posting) {
+        router.push('/inv/gr')
+        return
+      }
+
+      if (!isPostMode && savedReceipt?.id) {
+        router.push(`/inv/gr/post?id=${savedReceipt.id}`)
+        return
+      }
+
+      if (savedReceipt) setReceipt(savedReceipt)
+    } catch (error) {
+      console.log({ error })
+      toast('Error: ' + (error instanceof Error ? error.message : 'Unable to save goods receipt'))
     } finally {
       setSaving(false)
     }
   }
 
+  const activeBatchLine = receipt.lines.find(line => line.id === activeBatchLineId) ?? null
+  const activeBatchRequirement = activeBatchLine ? getBatchRequirement(activeBatchLine) : null
+  const activeBatchSeries = getBatchSeriesForRule(activeBatchRequirement?.rule)
+  const activeBatchParts = activeBatchLine ? getBatchNumberParts(activeBatchLine) : null
+  const activeBatchMatch = activeBatchLine ? batchMatches[String(activeBatchLine.id)] ?? null : null
+  const activeLineBatchMatch = activeBatchParts?.reusedFromLine ?? null
+  const activeBatchDateText = activeBatchRequirement?.needsExpiryDate ? 'MFG and EXP dates' : 'MFG date'
+  const activeBatchStatus = activeBatchMatch
+    ? 'Existing database batch'
+    : activeLineBatchMatch
+      ? 'Reusing current GR batch'
+      : activeBatchLine?.batchNumber
+        ? 'New batch to create'
+        : activeBatchRequirement?.needsExpiryDate
+          ? 'Waiting for dates'
+          : 'Waiting for MFG date'
+
+  const closeBatchDialog = () => {
+    pendingQuantityFocusLineId.current = activeBatchLine?.batchNumber.trim()
+      ? String(activeBatchLine.id)
+      : null
+    setActiveBatchLineId(null)
+  }
+
+  const focusQuantityAfterBatchClose = () => {
+    const lineId = pendingQuantityFocusLineId.current
+    pendingQuantityFocusLineId.current = null
+    if (!lineId) return false
+
+    const quantityInput = quantityInputRefs.current.get(lineId)
+    if (!quantityInput) return false
+
+    quantityInput.focus()
+    quantityInput.select()
+    return true
+  }
+
   return (
-    <main className="min-h-[calc(100vh-4rem)] bg-stone-50/40 pb-8 text-stone-950">
-      <header className="px-4 py-4">
-        <h1 className="text-xl font-semibold ">Goods Receive</h1>
-        <p className="mt-1 text-sm text-stone-500">Manage your goods receive direct.</p>
-      </header>
+    <PageShell>
+      <PageHeader>
+        <Breadcrumb
+          SecondPreviewPageName="Inventory"
+          SecondPreviewPageLink="/inv"
+          FirstPreviewsPageName="Feed Stock In"
+          FirstPreviewsPageLink="/inv/gr"
+          CurrentPageName={isPostMode ? 'Post GR' : 'Add Feeds Inventory'}
+        />
+        <PageHeaderActions>
+          <Button type="button" variant="outline" size="sm" onClick={() => router.push('/inv/gr')}>
+            <List className="size-4" />
+            Feed Stock In List
+          </Button>
+        </PageHeaderActions>
+      </PageHeader>
 
-      <div className="px-3 pt-4">
-        <div className="inline-flex rounded-full border bg-white p-1 shadow-sm">
-          <button
-            type="button"
-            className="inline-flex h-8 items-center gap-2 rounded-full bg-stone-950 px-4 text-sm font-semibold text-white shadow-sm"
-          >
-            <ArrowDownUp className="size-4" />
-            New GR
-          </button>
-          <button
-            type="button"
-            onClick={() => router.push('/inv/gr')}
-            className="inline-flex h-8 items-center gap-2 rounded-full px-4 text-sm font-medium hover:bg-stone-100"
-          >
-            <ClipboardClock className="size-4" />
-            Receive History
-          </button>
-        </div>
-      </div>
-
-      <section className="m-3 mt-6 overflow-hidden rounded-xl border bg-white shadow-sm">
-        <div className="grid gap-x-16 gap-y-3 p-5 lg:grid-cols-2">
-          <div className="grid items-center gap-2 sm:grid-cols-[96px_minmax(0,300px)]">
-            <label className="text-sm font-semibold">GR No.</label>
-            <div className="flex gap-2">
+      <PageSection>
+        <div className="grid gap-x-8 gap-y-2 p-3 lg:grid-cols-2">
+          <div className="grid items-center gap-1.5 sm:grid-cols-[88px_minmax(0,300px)]">
+            <label className="text-xs font-medium">GR No.</label>
+            <div className="flex items-center gap-1">
               <Input value={receipt.grNo} readOnly className="bg-stone-50" />
-              <Button type="button" variant="outline" onClick={() => router.push('/inv/gr')}>
-                <List className="size-4" />
-                GRs
-              </Button>
+              <span className={getInventoryStatusBadgeClass(receipt.status)}>
+                {receipt.status}
+              </span>
             </div>
           </div>
 
-          <div className="grid items-center gap-2 sm:grid-cols-[96px_minmax(0,300px)]">
-            <label className="text-sm font-semibold">Farm</label>
-            <select
-              value={receipt.farmId ?? ''}
-              disabled={loadingReferences}
-              onChange={event => {
-                const farm = farms.find(candidate => String(candidate.id) === event.target.value)
-                setReceipt(current => current ? {
-                  ...current,
-                  farmId: farm?.id ?? null,
-                  farmCode: farm?.code ?? '',
-                  farmName: farm?.name ?? '',
-                } : current)
-              }}
-              className="h-9 w-full rounded-md border bg-white px-3 text-sm outline-none focus:ring-2 focus:ring-stone-200"
-            >
-              <option value="">{loadingReferences ? 'Loading farms...' : 'Select farm'}</option>
-              {farms.map(farm => <option key={farm.id} value={farm.id}>{farm.code} - {farm.name}</option>)}
-            </select>
-          </div>
-
-          <div className="grid items-center gap-2 sm:grid-cols-[96px_minmax(0,300px)]">
-            <label className="text-sm font-semibold">Vendor</label>
+          <div className="grid items-center gap-1.5 sm:grid-cols-[88px_minmax(0,300px)]">
+            <label className="text-xs font-medium">Vendor</label>
             <Input
               value={receipt.vendor}
               onChange={event => setReceipt(current => current ? { ...current, vendor: event.target.value } : current)}
@@ -325,244 +1182,676 @@ export default function NewGoodsReceive() {
             />
           </div>
 
-          <div className="grid items-center gap-2 sm:grid-cols-[96px_minmax(0,300px)]">
-            <label className="text-sm font-semibold">Status:</label>
-            <div>
-              <span className="rounded-full bg-slate-700 px-3 py-1 text-xs font-semibold text-white">
-                {receipt.status}
-              </span>
-            </div>
+          <div className="grid items-center gap-1.5 sm:grid-cols-[88px_minmax(0,300px)]">
+            <label className="text-xs font-medium">FMS Type</label>
+            <select
+              value={receipt.fmsType}
+              disabled
+              className="h-10 w-full rounded-md border bg-muted px-3 text-sm text-muted-foreground outline-none disabled:cursor-not-allowed disabled:opacity-100 md:h-8"
+            >
+              <option value="">Select FMS type...</option>
+              {FMS_TYPE_OPTIONS.map(option => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
           </div>
 
-          <div className="grid items-center gap-2 sm:grid-cols-[96px_minmax(0,300px)]">
-            <label className="text-sm font-semibold">Receive Date</label>
-            <label className="relative">
-              <CalendarDays className="pointer-events-none absolute left-3 top-2.5 size-4" />
-              <Input
-                type="date"
-                value={receipt.receiveDate}
-                onChange={event => setReceipt(current => current ? { ...current, receiveDate: event.target.value } : current)}
-                className="pl-9"
-              />
-            </label>
+          <div className="grid items-center gap-1.5 sm:grid-cols-[88px_minmax(0,300px)] lg:col-span-2">
+            <label className="text-xs font-medium">Farm</label>
+            <SearchableCombobox
+              items={farmOptions}
+              value={receipt.farmId == null ? '' : String(receipt.farmId)}
+              onValueChange={selectFarm}
+              showCode={false}
+              placeholder={loadingReferences ? 'Loading farms...' : 'Select farm...'}
+              className="w-full"
+            />
+            {!loadingReferences && farms.length === 0 && (
+              <p className="text-xs text-muted-foreground">No assigned farms available.</p>
+            )}
           </div>
 
-          <div className="grid items-center gap-2 sm:grid-cols-[96px_minmax(0,300px)]">
-            <label className="text-sm font-semibold">Default WH</label>
+          <div className="grid items-center gap-1.5 sm:grid-cols-[88px_minmax(0,300px)] lg:col-span-2">
+            <label className="text-xs font-medium">Default WH</label>
             <select
               value={receipt.defaultWarehouseId ?? ''}
-              disabled={loadingReferences}
+              disabled={loadingReferences || !receipt.farmId}
               onChange={event => applyDefaultWarehouse(event.target.value)}
-              className="h-9 w-full rounded-md border bg-white px-3 text-sm outline-none focus:ring-2 focus:ring-stone-200"
+              className="h-10 w-full rounded-md border bg-card px-3 text-sm outline-none focus:border-ring focus:ring-2 focus:ring-ring/15 md:h-8"
             >
-              <option value="">{loadingReferences ? 'Loading warehouses...' : 'Select default warehouse...'}</option>
-              {warehouses.map(warehouse => (
+              <option value="">
+                {loadingReferences
+                  ? 'Loading warehouses...'
+                  : receipt.farmId
+                    ? 'Select default warehouse...'
+                    : 'Select farm first'}
+              </option>
+              {farmWarehouses.map(warehouse => (
                 <option key={warehouse.id} value={warehouse.id}>
                   {warehouse.whse_code} - {warehouse.whse_name}
                 </option>
               ))}
             </select>
+            {!loadingReferences && Boolean(receipt.farmId) && farmWarehouses.length === 0 && (
+              <p className="text-xs text-muted-foreground">No warehouses associated with this farm.</p>
+            )}
           </div>
         </div>
 
-        <div className="border-t p-5">
-          <section className="overflow-hidden rounded-lg border border-stone-200 bg-white shadow-sm">
-            <div className="border-b border-stone-200 bg-white px-3 py-3">
-              <h2 className="text-base font-semibold text-stone-950">
-                Receive Item Lines (Non-PO)
-              </h2>
-              <p className="mt-1 text-sm text-stone-600">
-                {receipt.lines.length} {receipt.lines.length === 1 ? 'line' : 'lines'}
-              </p>
-            </div>
-
-          <div className="overflow-x-auto">
-            <table className="min-w-[1250px] w-full text-sm">
-              <thead className="bg-stone-100">
-                <tr>
-                  <th className="h-10 w-12 whitespace-nowrap px-3 text-center align-middle text-xs font-semibold uppercase text-stone-700">#</th>
-                  <th className="h-10 min-w-80 whitespace-nowrap px-3 text-left align-middle text-xs font-semibold uppercase text-stone-700">Item Code &amp; Description</th>
-                  <th className="h-10 w-44 whitespace-nowrap px-3 text-left align-middle text-xs font-semibold uppercase text-stone-700">Base UOM Group</th>
-                  <th className="h-10 w-28 whitespace-nowrap px-3 text-left align-middle text-xs font-semibold uppercase text-stone-700">Alt Qty</th>
-                  <th className="h-10 w-28 whitespace-nowrap px-3 text-left align-middle text-xs font-semibold uppercase text-stone-700">Alt UoM</th>
-                  <th className="h-10 w-52 whitespace-nowrap px-3 text-left align-middle text-xs font-semibold uppercase text-stone-700">Conversion UoM</th>
-                  <th className="h-10 min-w-48 whitespace-nowrap px-3 text-left align-middle text-xs font-semibold uppercase text-stone-700">Warehouse</th>
-                  <th className="h-10 w-20 whitespace-nowrap px-3 text-center align-middle text-xs font-semibold uppercase text-stone-700">Action</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-stone-200">
-                {receipt.lines.map((line, index) => (
-                  <tr key={line.id} className="odd:bg-white even:bg-stone-50/70 hover:bg-stone-50">
-                    <td className="px-3 py-3 text-center align-middle text-stone-500">{index + 1}</td>
-                    <td className="px-3 py-2 align-middle">
-                      <SearchableDropdown
-                        list={items}
-                        codeLabel="item_code"
-                        nameLabel="item_name"
-                        value={line.itemCode}
-                        placeholder="Select item..."
-                        width={420}
-                        onChange={(value) => selectItem(line, value)}
-                      />
-                    </td>
-                    <td className="px-3 py-2 align-middle">
-                      <select
-                        value={line.baseUom}
-                        onChange={event => {
-                          const groupCode = event.target.value
-                          const altUomIsAvailable = conversions.some(
-                            conversion =>
-                              conversion.groupCode === groupCode &&
-                              conversion.uomCode.toUpperCase() === line.altUom.toUpperCase(),
-                          )
-                          const altUom = altUomIsAvailable ? line.altUom : ''
-
-                          updateLine(line.id, {
-                            baseUom: groupCode,
-                            altUom,
-                            baseQty: calculateBaseQty(line.altQty, altUom, groupCode),
-                          })
-                        }}
-                        className="h-9 w-full rounded-md border border-stone-300 bg-white px-2 text-sm outline-none transition focus:border-stone-500 focus:ring-2 focus:ring-stone-200"
-                      >
-                        <option value="">Select UoM group</option>
-                        {uomGroups.map(group => (
-                          <option key={group.id} value={group.code}>
-                            {group.code} - {group.name} ({group.baseUomCode})
-                          </option>
-                        ))}
-                      </select>
-                    </td>
-                    <td className="px-3 py-2 align-middle">
-                      <Input
-                        type="number"
-                        min="0"
-                        step="any"
-                        value={line.altQty}
-                        onChange={event => updateLine(line.id, {
-                          altQty: numberValue(event.target.value),
-                          baseQty: calculateBaseQty(
-                            numberValue(event.target.value),
-                            line.altUom,
-                            line.baseUom,
-                          ),
-                        })}
-                        className="border-stone-300 bg-white shadow-none focus-visible:ring-stone-200"
-                      />
-                    </td>
-                    <td className="px-3 py-2 align-middle">
-                      <select
-                        value={line.altUom}
-                        disabled={!line.baseUom}
-                        onChange={event => {
-                          const altUom = event.target.value
-                          updateLine(line.id, {
-                            altUom,
-                            baseQty: calculateBaseQty(line.altQty, altUom, line.baseUom),
-                          })
-                        }}
-                        className="h-9 w-full rounded-md border border-stone-300 bg-white px-2 text-sm outline-none transition focus:border-stone-500 focus:ring-2 focus:ring-stone-200 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:opacity-60"
-                      >
-                        <option value="">
-                          {line.baseUom ? 'Select Alt UoM' : 'Select group first'}
-                        </option>
-                        {getGroupUoms(line.baseUom).map(conversion => (
-                          <option
-                            key={`${conversion.groupId}-${conversion.uomCode}`}
-                            value={conversion.uomCode}
-                          >
-                            {conversion.uomCode}
-                          </option>
-                        ))}
-                      </select>
-                    </td>
-                    <td className="px-3 py-3 align-middle text-stone-800">
-                      {line.baseUom && line.altUom ? (
-                        <div className="whitespace-nowrap">
-                          <span className="font-medium tabular-nums">
-                            {line.baseQty.toLocaleString('en-PH', { maximumFractionDigits: 6 })}
-                          </span>{' '}
-                          <span className="text-stone-600">
-                            {getSelectedGroup(line.baseUom)?.baseUomCode}
-                          </span>
-                          <div className="text-xs text-stone-500">
-                            {line.altQty.toLocaleString('en-PH', { maximumFractionDigits: 6 })}{' '}
-                            {line.altUom} ×{' '}
-                            {getSelectedConversion(line.baseUom, line.altUom)?.baseQty.toLocaleString(
-                              'en-PH',
-                              { maximumFractionDigits: 6 },
-                            )}
-                          </div>
-                        </div>
-                      ) : (
-                        <span className="text-stone-400">-</span>
-                      )}
-                    </td>
-                    <td className="px-3 py-2 align-middle">
-                      <SearchableDropdown
-                        list={warehouses}
-                        codeLabel="whse_code"
-                        nameLabel="whse_name"
-                        value={line.warehouseCode}
-                        placeholder="Select warehouse..."
-                        width={360}
-                        onChange={(value) => selectWarehouse(line.id, value)}
-                      />
-                    </td>
-                    <td className="px-3 py-3 text-center align-middle">
-                      <button
-                        type="button"
-                        onClick={() => setReceipt(current => current ? {
-                          ...current,
-                          lines: current.lines.filter(candidate => candidate.id !== line.id),
-                        } : current)}
-                        className="inline-flex size-8 items-center justify-center rounded-md text-red-600 transition hover:bg-red-50 focus:outline-none focus:ring-2 focus:ring-red-200"
-                        aria-label={`Delete line ${index + 1}`}
-                      >
-                        <Trash2 className="size-4" />
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-
-            {receipt.lines.length === 0 && (
-              <div className="border-t border-stone-200 px-4 py-10 text-center">
-                <p className="text-sm font-medium text-stone-900">No item lines added</p>
-                <p className="mt-1 text-sm text-stone-500">Use Add Lines to continue.</p>
+        <div className="m-0 border-t p-0">
+          <FormTable
+            title="Receive Item Lines"
+            className="rounded-none border-0 shadow-none"
+            description={`${receipt.lines.length} ${receipt.lines.length === 1 ? 'line' : 'lines'}`}
+            actions={(
+              <div className="flex items-center justify-end gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={!receipt.farmId}
+                  title={!receipt.farmId ? 'Select a Farm before exporting the validated template.' : undefined}
+                  onClick={() => {
+                    void exportGoodsReceiptLinesTemplate({
+                      itemCodes: availableItems.map(item => item.item_code || ''),
+                      uomCodes: conversions.map(conversion => conversion.uomCode),
+                      warehouses: farmWarehouses.map(warehouse =>
+                        warehouse.whse_name
+                          ? `${warehouse.whse_code} - ${warehouse.whse_name}`
+                          : String(warehouse.whse_code ?? ''),
+                      ),
+                    }).catch(error => {
+                      console.error(error)
+                      toast.error('Unable to export the Goods Receipt item-lines template.')
+                    })
+                  }}
+                >
+                  <FileSpreadsheet className="size-4" />
+                  Export Template
+                </Button>
+                <input
+                  ref={goodsReceiptLinesImportInputRef}
+                  type="file"
+                  accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                  className="hidden"
+                  onChange={event => {
+                    const file = event.target.files?.[0]
+                    if (file) void handleGoodsReceiptLinesImport(file)
+                  }}
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={!canEditDraft || importingGoodsReceiptLines}
+                  onClick={() => goodsReceiptLinesImportInputRef.current?.click()}
+                >
+                  {importingGoodsReceiptLines ? <Loader2 className="size-4 animate-spin" /> : <FileUp className="size-4" />}
+                  {importingGoodsReceiptLines ? 'Importing...' : 'Import Excel'}
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={!canEditDraft || importingGoodsReceiptLines || saving}
+                  aria-expanded={pasteLinesOpen}
+                  aria-controls="goods-receipt-paste-lines"
+                  onClick={() => setPasteLinesOpen(open => !open)}
+                >
+                  Paste Text
+                </Button>
               </div>
             )}
+            emptyState={receipt.lines.length === 0 && (
+              <div className="border-t px-4 py-10 text-center">
+                <p className="text-sm font-medium text-foreground">No item lines added</p>
+                <p className="mt-1 text-sm text-muted-foreground">Use Add Lines to continue.</p>
+              </div>
+            )}
+            footer={(
+              <FormTableFooter>
+                <Input
+                  type="number"
+                  min="1"
+                  max="50"
+                  value={lineCount}
+                  onChange={event => setLineCount(Math.max(1, numberValue(event.target.value)))}
+                  className="w-20"
+                  aria-label="Number of lines to add"
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setReceipt(current => current ? {
+                    ...current,
+                    lines: [...current.lines, ...Array.from({ length: lineCount }, newLine)],
+                  } : current)}
+                >
+                  <Plus className="size-4" />
+                  Add Lines
+                </Button>
+              </FormTableFooter>
+            )}
+          >
+              <table className="w-full min-w-[1800px] table-fixed border-collapse text-xs [&_[data-slot=searchable-dropdown-trigger]]:h-7 [&_[data-slot=searchable-dropdown-trigger]]:rounded-none [&_[data-slot=searchable-dropdown-trigger]]:border-0 [&_[data-slot=searchable-dropdown-trigger]]:px-1.5 [&_[data-slot=searchable-dropdown-trigger]]:text-xs">
+                <thead>
+                  <tr>
+                    <th className="w-9 border border-border bg-muted px-1 py-1 text-center font-medium text-foreground">#</th>
+                    <th className="w-44 border border-border bg-muted px-1.5 py-1 text-left font-medium text-foreground">DR Reference</th>
+                    <th className="w-36 border border-border bg-muted px-1.5 py-1 text-left font-medium text-foreground">Received Date</th>
+                    <th className="w-36 border border-border bg-muted px-1.5 py-1 text-left font-medium text-foreground">Mnf Date</th>
+                    <th className="w-64 border border-border bg-muted px-1.5 py-1 text-left font-medium text-foreground">Item Code &amp; Description</th>
+                    <th className="w-36 border border-border bg-muted px-1.5 py-1 text-left font-medium text-foreground">Group</th>
+                    <th className="w-36 border border-border bg-muted px-1.5 py-1 text-left font-medium text-foreground">Sub Group</th>
+                    <th className="w-52 border border-border bg-muted px-1.5 py-1 text-left font-medium text-foreground">Batch</th>
+                    <th className="w-36 border border-border bg-muted px-1.5 py-1 text-left font-medium text-foreground">Base UOM Group</th>
+                    <th className="w-24 border border-border bg-muted px-1.5 py-1 text-left font-medium text-foreground">Alt Qty</th>
+                    <th className="w-24 border border-border bg-muted px-1.5 py-1 text-left font-medium text-foreground">Alt UoM</th>
+                    <th className="w-40 border border-border bg-muted px-1.5 py-1 text-left font-medium text-foreground">Conversion UoM</th>
+                    <th className="w-44 border border-border bg-muted px-1.5 py-1 text-left font-medium text-foreground">Warehouse</th>
+                    <th className="w-14 border border-border bg-muted px-1 py-1 text-center font-medium text-foreground">Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {receipt.lines.map((line, index) => {
+                    const batchRequirement = getBatchRequirement(line)
 
-            <div className="flex justify-end gap-2 border-t border-stone-200 bg-stone-50 px-3 py-3">
-              <Input
-                type="number"
-                min="1"
-                max="50"
-                value={lineCount}
-                onChange={event => setLineCount(Math.max(1, numberValue(event.target.value)))}
-                className="w-20 border-stone-300 bg-white"
-                aria-label="Number of lines to add"
+                    return (
+                      <tr key={line.id} className="even:bg-card odd:bg-muted/50">
+                        <td className="border border-border bg-muted p-1 text-center align-middle text-muted-foreground">{index + 1}</td>
+                        <td className="border border-border p-1 align-middle">
+                          <Input
+                            value={line.drReference}
+                            onChange={event => updateLine(line.id, { drReference: event.target.value })}
+                            onPaste={event => pasteDrReferences(event, line.id)}
+                            aria-label={`DR Reference row ${index + 1}`}
+                            placeholder="DR reference"
+                            className="h-7 rounded-none border-0 bg-background px-1.5 text-xs shadow-none"
+                          />
+                        </td>
+                        <td className="border border-border p-1 align-middle">
+                          <Input
+                            type="date"
+                            value={line.receiveDate}
+                            onChange={event => updateLine(line.id, { receiveDate: event.target.value })}
+                            aria-label={`Received Date row ${index + 1}`}
+                            className="h-7 rounded-none border-0 bg-background px-1.5 text-xs shadow-none"
+                          />
+                        </td>
+                        <td className="border border-border p-1 align-middle">
+                          <Input
+                            type="date"
+                            value={line.manufacturingDate}
+                            required={Boolean(batchRequirement?.needsManufacturingDate)}
+                            onChange={event => updateBatchLine(line, { manufacturingDate: event.target.value })}
+                            aria-label={`Manufacturing Date row ${index + 1}`}
+                            className="h-7 rounded-none border-0 bg-background px-1.5 text-xs shadow-none"
+                          />
+                        </td>
+                        <td className="border border-border p-1 align-middle">
+                          <SearchableDropdown
+                            list={itemDropdownOptions}
+                            codeLabel="item_code"
+                            nameLabel="itemDisplayDescription"
+                            value={line.itemCode}
+                            placeholder={receipt.fmsType ? 'Select item...' : 'Select FMS type first'}
+                            width={420}
+                            onChange={(value) => selectItem(line, value)}
+                          />
+                        </td>
+                        <td className="border border-border px-1.5 py-1 align-middle text-muted-foreground">
+                          <span className="block truncate" title={getItemGroupDisplay(line)}>
+                            {getItemGroupDisplay(line)}
+                          </span>
+                        </td>
+                        <td className="border border-border px-1.5 py-1 align-middle text-muted-foreground">
+                          <span className="block truncate" title={getSubItemGroupDisplay(line)}>
+                            {getSubItemGroupDisplay(line)}
+                          </span>
+                        </td>
+                        <td className="border border-border p-1 align-top">
+                          {batchRequirement ? (
+                            <button
+                              type="button"
+                              onClick={() => openBatchDialog(line)}
+                              className="flex min-h-7 w-full items-center justify-between gap-1 rounded-none border-0 bg-background px-1.5 py-1 text-left text-xs shadow-none transition hover:bg-accent focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring/20"
+                            >
+                              <span className="min-w-0">
+                                <span className="flex items-center gap-2 font-medium text-foreground">
+                                  <PackageCheck className="size-4 shrink-0 text-muted-foreground" />
+                                  <span className="truncate">
+                                    {line.batchNumber || 'Batch details'}
+                                  </span>
+                                </span>
+                                <span className="flex flex-wrap gap-1 text-[10px] leading-tight text-muted-foreground">
+                                  {line.manufacturingDate && <span>MFG {line.manufacturingDate}</span>}
+                                  {line.expiryDate && <span>EXP {line.expiryDate}</span>}
+                                  {(!line.manufacturingDate || (batchRequirement.needsExpiryDate && !line.expiryDate)) && (
+                                    <span>{batchRequirement.needsExpiryDate ? 'MFG/EXP required' : 'MFG required'}</span>
+                                  )}
+                                </span>
+                              </span>
+                              <Hash className="size-4 shrink-0 text-muted-foreground" />
+                            </button>
+                          ) : (
+                            <span className="inline-flex h-7 items-center px-1 text-muted-foreground">Not required</span>
+                          )}
+                        </td>
+                      <td className="border border-border p-1 align-middle">
+                        <select
+                          value={line.baseUom}
+                          disabled
+                          onChange={event => {
+                            const groupCode = event.target.value
+                            const altUomIsAvailable = conversions.some(
+                              conversion =>
+                                conversion.groupCode === groupCode &&
+                                conversion.uomCode.toUpperCase() === line.altUom.toUpperCase(),
+                            )
+                            const altUom = getSelectedGroup(groupCode)?.defaultUomCode || (altUomIsAvailable ? line.altUom : '')
+
+                            updateLine(line.id, {
+                              baseUom: groupCode,
+                              altUom,
+                              baseQty: calculateBaseQty(line.altQty, altUom, groupCode),
+                            })
+                          }}
+                          className="h-7 w-full rounded-none border-0 bg-muted px-1.5 text-xs text-muted-foreground outline-none transition disabled:cursor-not-allowed disabled:opacity-100"
+                        >
+                          <option value="">Select UoM group</option>
+                          {uomGroups.map(group => (
+                            <option key={group.id} value={group.code}>
+                              {group.code} - {group.name} ({group.baseUomCode})
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+                      <td className="border border-border p-1 align-middle">
+                        <Input
+                          ref={element => {
+                            const lineId = String(line.id)
+                            if (element) quantityInputRefs.current.set(lineId, element)
+                            else quantityInputRefs.current.delete(lineId)
+                          }}
+                          type="number"
+                          min="0"
+                          step="any"
+                          value={line.altQty}
+                          onChange={event => updateLine(line.id, {
+                            altQty: numberValue(event.target.value),
+                            baseQty: calculateBaseQty(
+                              numberValue(event.target.value),
+                              line.altUom,
+                              line.baseUom,
+                            ),
+                          })}
+                          className="h-7 rounded-none border-0 bg-background px-1.5 text-xs shadow-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/20"
+                        />
+                      </td>
+                      <td className="border border-border p-1 align-middle">
+                        <select
+                          value={line.altUom}
+                          disabled={!line.baseUom}
+                          onChange={event => {
+                            const altUom = event.target.value
+                            updateLine(line.id, {
+                              altUom,
+                              baseQty: calculateBaseQty(line.altQty, altUom, line.baseUom),
+                            })
+                          }}
+                          className="h-7 w-full rounded-none border-0 bg-background px-1.5 text-xs outline-none transition focus:ring-2 focus:ring-inset focus:ring-ring/20 disabled:cursor-not-allowed disabled:bg-muted disabled:opacity-60"
+                        >
+                          <option value="">
+                            {line.baseUom ? 'Select Alt UoM' : 'Select group first'}
+                          </option>
+                          {getGroupUoms(line.baseUom).map(conversion => (
+                            <option
+                              key={`${conversion.groupId}-${conversion.uomCode}`}
+                              value={conversion.uomCode}
+                            >
+                              {conversion.uomCode}
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+                      <td className="border border-border px-1.5 py-1 align-middle text-foreground">
+                        {line.baseUom && line.altUom ? (
+                          <div className="whitespace-nowrap">
+                            <span className="font-medium tabular-nums">
+                              {line.baseQty.toLocaleString('en-PH', { maximumFractionDigits: 6 })}
+                            </span>{' '}
+                            <span className="text-muted-foreground">
+                              {getSelectedGroup(line.baseUom)?.baseUomCode}
+                            </span>
+                            <div className="text-[10px] leading-tight text-muted-foreground">
+                              {line.altQty.toLocaleString('en-PH', { maximumFractionDigits: 6 })}{' '}
+                              {line.altUom} ×{' '}
+                              {getSelectedConversion(line.baseUom, line.altUom)?.baseQty.toLocaleString(
+                                'en-PH',
+                                { maximumFractionDigits: 6 },
+                              )}
+                            </div>
+                          </div>
+                        ) : (
+                          <span className="text-muted-foreground">-</span>
+                        )}
+                      </td>
+                      <td className="border border-border p-1 align-middle">
+                        <SearchableDropdown
+                          list={farmWarehouses}
+                          codeLabel="whse_code"
+                          nameLabel="whse_name"
+                          value={line.warehouseCode}
+                          placeholder={receipt.farmId ? 'Select warehouse...' : 'Select farm first'}
+                          width={360}
+                          onChange={(value) => selectWarehouse(line.id, value)}
+                        />
+                      </td>
+                      <td className="border border-border p-1 text-center align-middle">
+                        <button
+                          type="button"
+                          onClick={() => setReceipt(current => current ? {
+                            ...current,
+                            lines: current.lines.filter(candidate => candidate.id !== line.id),
+                          } : current)}
+                          className="inline-flex size-7 items-center justify-center rounded-none text-destructive transition hover:bg-destructive/10 focus:outline-none focus:ring-2 focus:ring-destructive/20"
+                          aria-label={`Delete line ${index + 1}`}
+                        >
+                          <Trash2 className="size-4" />
+                        </button>
+                      </td>
+                    </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+          </FormTable>
+          {pasteLinesOpen && canEditDraft && (
+            <div id="goods-receipt-paste-lines" className="mx-4 mt-3 space-y-2 rounded-md border border-border bg-muted/30 p-3">
+              <Label htmlFor="goods-receipt-paste-text">Paste item lines from Excel or tab-delimited text</Label>
+              <p id="goods-receipt-paste-help" className="text-xs text-muted-foreground">
+                Use template headers, or paste without headers in this order: {GOODS_RECEIPT_LINE_HEADERS.join(' | ')}.
+                Separate columns with tabs and rows with new lines. Blank Alt UoM and Warehouse use existing defaults.
+                Dates: YYYY-MM-DD or M/D/YYYY. Valid rows are appended only after the entire paste passes validation.
+              </p>
+              <textarea
+                id="goods-receipt-paste-text"
+                aria-describedby="goods-receipt-paste-help"
+                value={pastedLinesText}
+                onChange={event => setPastedLinesText(event.target.value)}
+                placeholder={'ITEM001\t10\tBAG'}
+                rows={5}
+                spellCheck={false}
+                className="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               />
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => setReceipt(current => current ? {
-                  ...current,
-                  lines: [...current.lines, ...Array.from({ length: lineCount }, newLine)],
-                } : current)}
-              >
-                <Plus className="size-4" />
-                Add Lines
-              </Button>
+              <div className="flex justify-end gap-2">
+                <Button type="button" variant="outline" onClick={() => setPasteLinesOpen(false)}>Cancel</Button>
+                <Button
+                  type="button"
+                  disabled={!pastedLinesText.trim() || importingGoodsReceiptLines || saving}
+                  onClick={() => {
+                    if (applyGoodsReceiptLinesImport(parseGoodsReceiptLinesText(pastedLinesText))) {
+                      setPastedLinesText('')
+                      setPasteLinesOpen(false)
+                    }
+                  }}
+                >
+                  Add Pasted Lines
+                </Button>
+              </div>
             </div>
-          </section>
+          )}
+          {goodsReceiptLinesImportIssues.length > 0 && (
+            <div role="alert" className="mx-4 mt-3 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+              <p className="font-semibold">Goods Receipt item-lines import was not applied.</p>
+              <ul className="mt-1 list-disc space-y-1 pl-5">
+                {goodsReceiptLinesImportIssues.map((issue, index) => <li key={`${index}-${issue}`}>{issue}</li>)}
+              </ul>
+            </div>
+          )}
 
-          <div className="mt-6 flex flex-col items-end gap-4">
-            <div className="w-full rounded-xl border p-4 sm:w-[34rem]">
+          <BatchDetailsDialog
+            open={Boolean(activeBatchLine)}
+            itemCode={activeBatchLine?.itemCode}
+            footerAction={activeBatchLine ? (
+              <BatchWarehouseReportButton
+                batchNumber={activeBatchLine.batchNumber}
+                rows={batchTrailRows}
+              />
+            ) : undefined}
+            onClose={closeBatchDialog}
+            onCloseAutoFocus={focusQuantityAfterBatchClose}
+          >
+
+              {activeBatchLine && activeBatchRequirement && (
+                <Tabs defaultValue="details" className="space-y-4">
+                  <TabsList>
+                    <TabsTrigger value="details">Batch Details</TabsTrigger>
+                    <TabsTrigger value="trail">Batch Trail</TabsTrigger>
+                  </TabsList>
+
+                  <TabsContent value="details" className="space-y-4">
+                    <div className="rounded-md border border-stone-200 bg-stone-50 px-3 py-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Badge variant="outline">
+                          {activeBatchRequirement.rule?.auto_generate || !activeBatchRequirement.rule ? 'Auto number' : 'Manual number'}
+                        </Badge>
+                        {activeBatchRequirement.rule?.manual_entry && (
+                          <Badge variant="outline">Manual edits allowed</Badge>
+                        )}
+                        {activeBatchSeries && (
+                          <Badge variant="secondary">{activeBatchSeries.code}</Badge>
+                        )}
+                        <Badge
+                          className={
+                            activeBatchMatch || activeLineBatchMatch
+                              ? 'bg-emerald-100 text-emerald-800 hover:bg-emerald-100'
+                              : activeBatchLine?.batchNumber
+                                ? 'bg-amber-100 text-amber-800 hover:bg-amber-100'
+                                : 'bg-stone-100 text-stone-700 hover:bg-stone-100'
+                          }
+                        >
+                          {activeBatchStatus}
+                        </Badge>
+                        {(activeBatchMatch || activeLineBatchMatch) && (
+                          <Badge className="bg-emerald-100 text-emerald-800 hover:bg-emerald-100">
+                            Reusing batch
+                          </Badge>
+                        )}
+                      </div>
+                    </div>
+
+                    {activeBatchMatch && (
+                      <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-900">
+                        This item already has a batch for the selected {activeBatchDateText}. GR will use batch{' '}
+                        <span className="font-semibold">{activeBatchMatch.batch_number}</span>.
+                      </div>
+                    )}
+
+                    {!activeBatchMatch && activeLineBatchMatch && (
+                      <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-900">
+                        Another line in this GR already uses the same item and {activeBatchDateText}. This line will use batch{' '}
+                        <span className="font-semibold">{activeLineBatchMatch.batchNumber}</span>.
+                      </div>
+                    )}
+
+                    <div className="grid gap-4 sm:grid-cols-2">
+                      {activeBatchRequirement.needsManufacturingDate && (
+                        <div className="space-y-2">
+                          <Label htmlFor="gr-manufacturing-date" required>Manufacturing Date</Label>
+                          <Input
+                            ref={manufacturingDateInputRef}
+                            id="gr-manufacturing-date"
+                            type="date"
+                            value={activeBatchLine.manufacturingDate}
+                            onChange={event => updateBatchLine(activeBatchLine, { manufacturingDate: event.target.value })}
+                            className="border-stone-300 bg-white shadow-none focus-visible:ring-stone-200"
+                          />
+                        </div>
+                      )}
+
+                      {activeBatchRequirement.needsExpiryDate && (
+                        <div className="space-y-2">
+                          <Label htmlFor="gr-expiry-date" required>Expiry Date</Label>
+                          <Input
+                            id="gr-expiry-date"
+                            type="date"
+                            value={activeBatchLine.expiryDate}
+                            onChange={event => updateBatchLine(activeBatchLine, { expiryDate: event.target.value })}
+                            className="border-stone-300 bg-white shadow-none focus-visible:ring-stone-200"
+                          />
+                        </div>
+                      )}
+
+                      {activeBatchRequirement.needsSupplierBatch && (
+                        <div className="space-y-2 sm:col-span-2">
+                          <Label htmlFor="gr-supplier-batch" required>Supplier Batch Number</Label>
+                          <Input
+                            id="gr-supplier-batch"
+                            value={activeBatchLine.supplierBatchNumber}
+                            onChange={event => updateLine(activeBatchLine.id, { supplierBatchNumber: event.target.value })}
+                            placeholder="Supplier batch no."
+                            className="border-stone-300 bg-white shadow-none focus-visible:ring-stone-200"
+                          />
+                        </div>
+                      )}
+
+                      <div className="space-y-2 sm:col-span-2">
+                        <Label htmlFor="gr-batch-number">Generated Batch Number</Label>
+                        <div className="flex gap-2">
+                          <Input
+                            id="gr-batch-number"
+                            value={activeBatchLine.batchNumber}
+                            readOnly={!activeBatchRequirement.rule?.manual_entry && Boolean(activeBatchRequirement.rule)}
+                            onChange={event => updateLine(activeBatchLine.id, { batchNumber: event.target.value })}
+                            placeholder={activeBatchRequirement.needsExpiryDate ? 'Enter MFG and EXP dates to generate' : 'Enter MFG date to generate'}
+                            className="border-stone-300 bg-white shadow-none focus-visible:ring-stone-200"
+                          />
+                          <Button
+                            type="button"
+                            variant="outline"
+                            onClick={() => refreshGeneratedBatchNumber(activeBatchLine)}
+                          >
+                            <Hash className="size-4" />
+                            Generate
+                          </Button>
+                        </div>
+                      </div>
+
+                      {activeBatchParts && (
+                        <div className="space-y-3 rounded-md border border-stone-200 bg-stone-50 p-3 sm:col-span-2">
+                          <div className="grid gap-3 sm:grid-cols-4">
+                            <div className="space-y-2">
+                              <Label htmlFor="gr-batch-source">Template Source</Label>
+                              <Input
+                                id="gr-batch-source"
+                                value={activeBatchParts.templateSource}
+                                disabled
+                                className="border-stone-300 bg-white text-stone-700 disabled:opacity-100"
+                              />
+                            </div>
+                            <div className="space-y-2">
+                              <Label htmlFor="gr-batch-date-format">Date Format</Label>
+                              <Input
+                                id="gr-batch-date-format"
+                                value={activeBatchParts.dateFormat}
+                                disabled
+                                className="border-stone-300 bg-white text-stone-700 disabled:opacity-100"
+                              />
+                            </div>
+                            <div className="space-y-2">
+                              <Label htmlFor="gr-batch-exp-months">Exp. Months</Label>
+                              <Input
+                                id="gr-batch-exp-months"
+                                value={activeBatchParts.defaultExpirationMonths == null ? '-' : String(activeBatchParts.defaultExpirationMonths)}
+                                disabled
+                                className="border-stone-300 bg-white text-stone-700 disabled:opacity-100"
+                              />
+                            </div>
+                            <div className="space-y-2">
+                              <Label htmlFor="gr-batch-separator">Separator</Label>
+                              <Input
+                                id="gr-batch-separator"
+                                value={activeBatchParts.separator}
+                                disabled
+                                className="border-stone-300 bg-white text-stone-700 disabled:opacity-100"
+                              />
+                            </div>
+                          </div>
+
+                          <div className="grid gap-3 sm:grid-cols-5">
+                            <div className="space-y-2">
+                              <Label htmlFor="gr-batch-prefix">Prefix</Label>
+                              <Input
+                                id="gr-batch-prefix"
+                                value={activeBatchParts.prefix || '-'}
+                                disabled
+                                className="border-stone-300 bg-white text-stone-700 disabled:opacity-100"
+                              />
+                            </div>
+                            <div className="space-y-2">
+                              <Label htmlFor="gr-batch-mfg-part">MFG Part</Label>
+                              <Input
+                                id="gr-batch-mfg-part"
+                                value={activeBatchParts.mfgPart || '-'}
+                                disabled
+                                className="border-stone-300 bg-white text-stone-700 disabled:opacity-100"
+                              />
+                            </div>
+                            <div className="space-y-2">
+                              <Label htmlFor="gr-batch-exp-part">EXP Part</Label>
+                              <Input
+                                id="gr-batch-exp-part"
+                                value={activeBatchParts.expPart || '-'}
+                                disabled
+                                className="border-stone-300 bg-white text-stone-700 disabled:opacity-100"
+                              />
+                            </div>
+                            <div className="space-y-2">
+                              <Label htmlFor="gr-batch-sequence">Sequence</Label>
+                              <Input
+                                id="gr-batch-sequence"
+                                value={activeBatchParts.sequence}
+                                disabled
+                                className="border-stone-300 bg-white text-stone-700 disabled:opacity-100"
+                              />
+                            </div>
+                            <div className="space-y-2">
+                              <Label htmlFor="gr-batch-suffix">Suffix</Label>
+                              <Input
+                                id="gr-batch-suffix"
+                                value={activeBatchParts.suffix || '-'}
+                                disabled
+                                className="border-stone-300 bg-white text-stone-700 disabled:opacity-100"
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </TabsContent>
+
+                  <TabsContent value="trail" className="space-y-4">
+                    <BatchTransactionTimeline
+                      itemCode={activeBatchLine.itemCode}
+                      batchNumber={activeBatchLine.batchNumber}
+                      warehouseCode={activeBatchLine.warehouseCode}
+                      quantityLabel="Line Quantity"
+                      quantityValue={formatQuantity(activeBatchLine.baseQty)}
+                      rows={batchTrailRows}
+                      loading={loadingBatchTrail}
+                      error={batchTrailError}
+                      onRetry={() => setBatchTrailRetry(value => value + 1)}
+                    />
+                  </TabsContent>
+                </Tabs>
+              )}
+
+          </BatchDetailsDialog>
+
+          <div className="mt-3 flex flex-col items-end gap-3 px-3">
+            <div className="w-full rounded-md border bg-muted/20 p-3 sm:w-[28rem]">
               <h3 className="text-sm font-semibold">Receiving Summary</h3>
-              <div className="mt-3 flex justify-between text-sm">
+              <div className="mt-2 flex justify-between text-xs">
                 <span>Total Base Quantity</span>
                 <span className="font-medium tabular-nums">
                   {totalQuantity.toLocaleString('en-PH', { maximumFractionDigits: 6 })}
@@ -570,13 +1859,42 @@ export default function NewGoodsReceive() {
               </div>
             </div>
 
-            <Button type="button" onClick={handleSave} disabled={saving}>
-              <Save className="size-4" />
-              {saving ? 'Saving...' : 'Receive Goods'}
-            </Button>
+            {canEditDraft ? (
+              <PageActionBar className="w-full border-0 bg-transparent p-0 pb-3">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => handleSave('Draft')}
+                  disabled={saving}
+                >
+                  <Save className="size-4" />
+                  {saving ? 'Saving...' : 'Save as Draft'}
+                </Button>
+                {canPostDocument && (
+                  <Button type="button" onClick={() => setPostConfirmOpen(true)} disabled={saving}>
+                    <Save className="size-4" />
+                    {saving ? 'Posting...' : 'Save Document'}
+                  </Button>
+                )}
+              </PageActionBar>
+            ) : (
+              <p className="pb-3 text-sm text-muted-foreground">This document is already posted and cannot be edited.</p>
+            )}
           </div>
         </div>
-      </section>
-    </main>
+      </PageSection>
+
+      <PostGoodsReceiptDialog
+        open={postConfirmOpen}
+        receiptNumber={receipt.grNo}
+        totalQuantity={totalQuantity}
+        saving={saving}
+        onOpenChange={open => !saving && setPostConfirmOpen(open)}
+        onConfirm={async () => {
+          await handleSave('Posted')
+          setPostConfirmOpen(false)
+        }}
+      />
+    </PageShell>
   )
 }

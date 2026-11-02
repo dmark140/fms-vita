@@ -3,12 +3,14 @@ import { useCallback, useEffect, useState } from 'react'
 import { getUserFarms } from '../admin/user/new/api'
 import SearchableCombobox, { type ComboboxItemType } from '@/components/SearchableCombobox'
 import { useGlobalContext } from '@/lib/context/GlobalContext'
+import { useDefaultFarmSelection } from '@/lib/farms/useDefaultFarmSelection'
 
 type FarmOption = ComboboxItemType & {
     id?: number | string
     farm_id?: number | string
     farm_code?: string
     farm_name?: string
+    farm_type?: string | null
 }
 
 type Params = {
@@ -17,6 +19,8 @@ type Params = {
     value?: string | number | null
     autoDefault?: boolean
     valueKey?: 'id' | 'code'
+    farmType?: string
+    updatesDefaultFarm?: boolean
 }
 
 export default function DefaultFarmComboBox({
@@ -25,14 +29,28 @@ export default function DefaultFarmComboBox({
     value,
     autoDefault = true,
     valueKey = 'code',
+    farmType,
+    updatesDefaultFarm = label === 'Farm',
 }: Params) {
     // commit to build
     const { getValue } = useGlobalContext()
+    const selectDefaultFarm = useDefaultFarmSelection()
     const selectedUser = getValue('UserInfoAuthSession')?.[0] as { id?: string | number } | undefined
 
     const [farmList, setFarmList] = useState<FarmOption[]>([])
 
     const getFarmId = useCallback((farm?: FarmOption) => farm?.id ?? farm?.farm_id, [])
+    const matchesFarmType = useCallback((farm: FarmOption) => {
+        if (!farmType || String(farm.farm_type ?? '').trim() === farmType) return true
+
+        const defaultReference = getValue('DefaultFarmId')
+            ?? getValue('UserInfoAuthSession')?.[0]?.default_farm
+        const normalizedDefault = String(defaultReference ?? '').trim()
+        return normalizedDefault !== '' && (
+            String(getFarmId(farm) ?? '') === normalizedDefault
+            || String(farm.code ?? farm.farm_code ?? '').trim() === normalizedDefault
+        )
+    }, [farmType, getFarmId, getValue])
 
     const normalizeFarm = useCallback((farm: FarmOption, masterList: FarmOption[] = []): FarmOption | null => {
         const code = farm.code ?? farm.farm_code ?? ''
@@ -57,6 +75,7 @@ export default function DefaultFarmComboBox({
             const farmDB = (getValue('getFarmDB') || []) as FarmOption[]
             const allowedFarms = farmDB
                 .filter((farm) => userFarmCodes.includes(farm.code))
+                .filter(matchesFarmType)
                 .map((farm) => normalizeFarm(farm, farmDB))
                 .filter((farm): farm is FarmOption => Boolean(farm))
 
@@ -68,6 +87,7 @@ export default function DefaultFarmComboBox({
             const farms = await getUserFarms(Number(selectedUser.id))
             const normalizedFarms = Array.isArray(farms)
                 ? (farms as FarmOption[])
+                    .filter(matchesFarmType)
                     .map((farm) => normalizeFarm(farm, farmDB))
                     .filter((farm): farm is FarmOption => Boolean(farm))
                 : []
@@ -76,7 +96,7 @@ export default function DefaultFarmComboBox({
         }
         init()
 
-    }, [getValue, normalizeFarm, selectedUser?.id])
+    }, [getValue, matchesFarmType, normalizeFarm, selectedUser?.id])
 
     const selectedFarm = farmList.find((farm) =>
         valueKey === 'id'
@@ -100,13 +120,20 @@ export default function DefaultFarmComboBox({
         if (String(nextValue) === String(value ?? '')) return
 
         setValue(nextValue)
-    }, [setValue, value])
+        if (updatesDefaultFarm) {
+            const selected = farmList.find((farm) => valueKey === 'id'
+                ? String(getFarmId(farm)) === String(nextValue)
+                : String(farm.code) === String(nextValue))
+            const selectedId = getFarmId(selected)
+            if (selectedId != null) void selectDefaultFarm(selectedId).catch(() => undefined)
+        }
+    }, [farmList, getFarmId, selectDefaultFarm, setValue, updatesDefaultFarm, value, valueKey])
 
     /**
      * Set default combobox value
      * Priority:
      * 1. DefaultFarmId
-     * 2. First available user farm
+     * If the saved default is unavailable, keep the selector blank.
      */
     useEffect(() => {
         if (!autoDefault) return
@@ -122,11 +149,6 @@ export default function DefaultFarmComboBox({
             if (defaultFarm) {
                 nextValue = valueKey === 'id' ? getFarmId(defaultFarm) : defaultFarm.code
             }
-        }
-
-        if (nextValue === undefined) {
-            const firstFarm = farmList[0]
-            nextValue = valueKey === 'id' ? getFarmId(firstFarm) : firstFarm?.code
         }
 
         if (nextValue !== undefined) {

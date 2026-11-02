@@ -5,15 +5,24 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useRouter } from "next/navigation";
-import { LoaderIcon } from "lucide-react";
+import { ArrowRight, LoaderIcon, LockKeyhole, Mail } from "lucide-react";
 import { toast } from "sonner";
 import { db } from "../Supabase/supabaseClient";
 import { useGlobalContext } from "../context/GlobalContext";
 import { useGlobalDefaults } from "../Defaults/GlobalDefaults";
-import Image from "next/image";
 import { Modal } from "../Moda";
 import { encryptValue } from "../encrypt";
 import { createApprovalRequest } from "./api";
+import { getRegistrationStatus } from "@/lib/data/repositories/registration";
+
+function normalizeLoginEmail(value: string): string {
+  const trimmed = value.trim()
+  const completeEmail = /^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$/
+  if (completeEmail.test(trimmed) || !/^[^\s@]+(?:@[^\s@]*)?$/.test(trimmed)) {
+    return trimmed
+  }
+  return `${trimmed.split("@")[0]}@vitarich.com`
+}
 
 export function LoginForm({
   className,
@@ -35,23 +44,42 @@ export function LoginForm({
     e.preventDefault();
     setloading(true)
     try {
+      const loginEmail = normalizeLoginEmail(email)
+      setEmail(loginEmail)
       const { error } = await db.auth.signInWithPassword({
-        email,
+        email: loginEmail,
         password,
       });
 
       if (error) {
-        toast(error.message)
+        toast.error(error.code === "user_banned" ? "Your account is awaiting activation or has been rejected. Please check your email." : error.message)
         setloading(false)
       } else {
-        setGlobals()
+        // Resume registration if the user left before saving personal information.
+        const status = await getRegistrationStatus()
+        if (status.approvalStatus !== "activated") {
+          await db.auth.signOut()
+          toast.error(status.approvalStatus === "rejected" ? "Your registration was rejected. Please check your email." : "Your account is awaiting administrator activation.")
+          return
+        }
+        if (status.registrationReady !== false && !status.profileComplete) {
+          router.push("/signup_update")
+          return
+        }
+        await setGlobals()
         setValue('loading_g', true)
         router.push("/init");
         setloading(false)
         setValue('loading_g', false)
       }
     } catch (error) {
-      alert("An error occurred during login. Please try again.")
+      toast.error(
+        error && typeof error === "object" && "message" in error && typeof error.message === "string"
+          ? error.message
+          : "An error occurred during login. Please try again."
+      )
+    } finally {
+      setloading(false)
     }
   }
 
@@ -81,58 +109,56 @@ export function LoginForm({
   }
 
   return (
-    <form className={cn("flex flex-col gap-6", className)} {...props} onSubmit={handleLogin}>
-      <div className="flex flex-col items-center gap-2 text-center">
-        <Image
-          src="https://cdn.prod.website-files.com/6819a7964b427b4964f82cc0/68203089539798c6cc2ba1c0_Corporate-Logo_Vitarich-White.png"
-          alt="Vitarich Logo"
-          width={110}
-          height={110}
-        />
-        <h1 className="text-2xl">Login to your account</h1>
-        <p className="text-muted-foreground text-sm text-balance">
-          Enter your email below to login to your account
-        </p>
-      </div>
-      <div>
-      </div>
-      <div className="grid gap-6 bg-white p-4 rounded-md border border-black/20 shadow">
+    <form className={cn("flex flex-col gap-4", className)} {...props} onSubmit={handleLogin}>
+      <div className="grid gap-5 rounded-md border bg-card p-5 text-card-foreground shadow-[0_18px_45px_rgba(20,55,38,0.12)] sm:p-6">
         <div className="grid gap-3">
-          <Label>Email</Label>
-          <Input
-            type="email"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            required
-          />
+          <Label className="text-foreground">Email</Label>
+          <div className="relative">
+            <Input
+              type="text"
+              inputMode="email"
+              autoComplete="username"
+              autoCapitalize="none"
+              spellCheck={false}
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              onBlur={() => setEmail(normalizeLoginEmail(email))}
+              className="h-11 pl-9"
+              placeholder="name@vitarich.com"
+              required
+            />
+          </div>
         </div>
 
         <div className="grid gap-3">
           <div className="flex items-center">
-            <Label>Password</Label>
+            <Label className="text-foreground">Password</Label>
             <span
               onClick={() => setOpenModal(true)}
-              className="cursor-pointer text-blue-700 font-semibold ml-auto text-sm underline-offset-4 hover:underline"
+              className="ml-auto cursor-pointer text-sm font-semibold text-primary underline-offset-4 hover:underline"
             >
               Forgot Password?
             </span>
           </div>
-          <Input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            className="border p-2 rounded"
-            required
-          />
+          <div className="relative">
+            <Input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              className="h-11 pl-9"
+              placeholder="Enter your password"
+              required
+            />
+          </div>
         </div>
 
-        <Button type="submit" className="w-full" disabled={loading}>
-          {loading ? <LoaderIcon className="animate-spin" /> : "Login"}
+        <Button type="submit" size="lg" className="mt-1 w-full bg-[#00754a] hover:bg-[#006241]" disabled={loading}>
+          {loading ? <LoaderIcon className="animate-spin" /> : <>Login <ArrowRight className="size-4" /></>}
         </Button>
       </div>
-      <div className=" gap-6  p-4 rounded-md border border-black/20 shadow flex text-sm text-center ">
-        <div className="mx-auto flex gap-2">
-          New to Hatchery?<a href="/signup" className="text-blue-600 font-semibold">Create an account</a>
+      <div className="rounded-md border bg-card/75 p-4 text-center text-sm text-muted-foreground shadow-[var(--starbucks-card-shadow)]">
+        <div className="mx-auto flex flex-wrap justify-center gap-2">
+          <span>New to FMS?</span><a href="/signup" className="font-semibold text-primary">Create an account</a>
         </div>
       </div>
       <Modal
@@ -157,7 +183,7 @@ export function LoginForm({
               <Label>New Password</Label>
               <button
                 onClick={() => setshowpass(!showpass)}
-                className="text-sm cursor-pointer text-blue-600/80 font-semibold underline" >
+                className="cursor-pointer text-sm font-semibold text-primary underline" >
                 {showpass ? "Hide" : "Show"}
               </button>
             </div>

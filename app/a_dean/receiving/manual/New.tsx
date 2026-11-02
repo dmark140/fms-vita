@@ -14,7 +14,7 @@ import { DataRecordApproval, DraftItem, Farms } from '@/lib/types'
 import { today } from '@/lib/Defaults/DefaultValues'
 import Breadcrumb from '@/lib/Breadcrumb'
 import SearchableDropdown from '@/lib/SearchableDropdown'
-import { createReceiving, getUserInfo } from './api'
+import { createReceiving } from './api'
 import { Plus, Save, CalendarDays } from 'lucide-react'
 import { useRouter } from 'next/navigation'
 import { Separator } from '@/components/ui/separator'
@@ -31,6 +31,8 @@ import SearchableCombobox from '@/components/SearchableCombobox'
 import DefaultFarmComboBox from '@/app/components/DefaultFarmComboBox'
 import { VerticalRuler2 } from '@/components/VerticalRuler2'
 import { usePermission } from '@/hooks/usePermission'
+import ReceivingSourcePicker from '@/components/inventory/ReceivingSourcePicker'
+import { allocationTotals } from '@/lib/data/repositories/receivingSources'
 
 type ItemMasterType = {
     id: number
@@ -78,6 +80,7 @@ export default function ApprovalDecisionForm() {
     const [items, setItems] = useState<DraftItem[]>([])
     const [ItemMaster, setItemMaster] = useState<ItemMasterType[]>([])
     const [selectedRows, setSelectedRows] = useState<number[]>([])
+    const [clientRequestKey] = useState(() => crypto.randomUUID())
 
     const [postingDate, setPostingDate] = useState(today)
     const [temperature, setTemperature] = useState('')
@@ -176,31 +179,6 @@ export default function ApprovalDecisionForm() {
     //   if (!header) return
     //   getDefaultFarm()
     // }, [header, getValue])
-    const getDefaultFarm = async () => {
-        const defaultFarmId = getValue("DefaultFarmId")
-
-        if (defaultFarmId) {
-            setHeader(h =>
-                h && !h.delivered_to
-                    ? { ...h, delivered_to: defaultFarmId }
-                    : h
-            )
-            return
-        }
-
-        const data = await getUserInfo()
-
-        if (data?.length) {
-            setHeader(h =>
-                h && !h.delivered_to
-                    ? { ...h, delivered_to: data[0].id }
-                    : h
-            )
-        }
-    }
-    useEffect(() => {
-        getDefaultFarm()
-    }, [])
     useEffect(() => {
         refreshSessionx(router)
     }, [])
@@ -333,11 +311,13 @@ export default function ApprovalDecisionForm() {
             prod_date_to: i.prod_date_to ?? "",
             age: i.age ?? "",
             total_api: i.total ?? 0,
+            expected_count: i.total ?? i.actual_total ?? 0,
             actual_count: i.actual_total ?? 0,
         }))
         console.log({ transformedItems })
 
         const payload = {
+            clientRequestKey,
             doc_date: header?.doc_date ?? "",
             temperature: Number(temperature) || 0,
             humidity: Number(humidity) || 0,
@@ -363,7 +343,12 @@ export default function ApprovalDecisionForm() {
         setloading(false)
 
         if (res.success) {
-            alert(`Saved! DocEntry: ${res.docentry}`)
+            const approvalRequired = Boolean(res.approval?.required)
+            alert(
+                approvalRequired
+                    ? `Submitted for approval! DocEntry: ${res.docentry}`
+                    : `Saved! DocEntry: ${res.docentry}`
+            )
             router.push("/a_dean/receiving/")
         } else {
             alert(res.error)
@@ -497,7 +482,7 @@ export default function ApprovalDecisionForm() {
                 : prev
         )
     }, [header?.soldTo, farms])
-
+// 
 
     return (
         <form onSubmit={handleSubmit}>
@@ -512,6 +497,30 @@ export default function ApprovalDecisionForm() {
                             />
                         </div>
                         <div className="flex gap-2">
+                            <ReceivingSourcePicker kind="hatchery" farmId={Number(header.delivered_to) || null} disabled={loading || canInsert}
+                                targets={items.map((item, index) => ({ key: String(item.id), label: `Line ${index + 1} · ${item.sku || 'Select item'} · ${item.actual_total ?? 0}`, allocations: item.source_allocations ?? [] }))}
+                                onApply={(key, allocations, sources) => {
+                                    const selected = sources.filter(source => allocations.some(row => row.sourceLineId === source.sourceLineId))
+                                    const first = selected[0]
+                                    if (new Set(selected.map(source => source.originFarmCode)).size > 1) throw new Error('Use one breeder source farm per receiving document. Batches can be combined during processing.')
+                                    if (items.some(item => item.source_allocations?.length) && header.soldTo && header.soldTo !== first.originFarmCode) throw new Error('Select dispatches from the same breeder farm as the existing receiving lines.')
+                                    const totals = allocationTotals(allocations)
+                                    const current = items.find(item => String(item.id) === key)
+                                    const next: DraftItem = { ...(current ?? { id: Date.now(), brdr_ref_no: '', brdr_ref_noVx: '', sku: '', UoM: 'PCS', isNew: true }),
+                                        source_allocations: allocations, total: totals.quantity, actual_total: totals.actual,
+                                        prod_date: current?.prod_date || first.productionDate,
+                                        brdr_ref_no: current?.brdr_ref_no || first.documentNo,
+                                        lot_no: current?.lot_no || first.placementDate || '',
+                                        house_no: current?.house_no || [...new Set(selected.map(source => source.buildingName))].join(', '),
+                                        age: current?.age || selected.map(source => {
+                                            const days = Math.max(0, Math.floor((Date.parse(source.productionDate) - Date.parse(source.placementDate || source.productionDate)) / 86400000))
+                                            return `${Math.floor(days / 7)} Weeks, ${days % 7} Day(s)`
+                                        }).join(', '),
+                                    }
+                                    setItems(rows => current ? rows.map(row => row.id === current.id ? next : row) : [...rows, next])
+                                    setHeader(value => ({ ...value, soldTo: first.originFarmCode, dr_num: [...new Set(selected.map(source => source.documentNo))].join(', ') }))
+                                    if (!brdr_ref_no) setbrdr_ref_no(first.documentNo)
+                                }} />
                             <Button type="submit" disabled={loading}>
                                 <Save className="mr-2 h-4 w-4" /> Save Record
                             </Button>
@@ -520,42 +529,39 @@ export default function ApprovalDecisionForm() {
                     </div>
                 </CardHeader>
 
-                <CardContent className='bg-white rounded-2xl p-4 space-y-6'>
-                    <div className="grid md:grid-cols-2 lg:grid-cols-2 sm:grid-cols-1 gap-4">
-                        <div className="flex items-center gap-4 w-full md:w-100 `">
+                <CardContent className='rounded-md border border-border bg-white p-4 md:p-5 space-y-5'>
+                    <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
+                        <div className="space-y-2">
                             <Label
-                                className="text-sm font-medium w-27 shrink-0 text-right"
+                                className="text-sm font-medium text-foreground"
                                 required
                             >
                                 Delivered From
                             </Label>
-                            <div className='w-full'>
+                            <SearchableCombobox
+                                multiple={false}
+                                required
+                                showCode
+                                autoHighlight
+                                className="w-full"
+                                items={farms}
+                                value={header?.soldTo || ''}
+                                onValueChange={(val) => {
+                                    const selectedFarm = farms.find((f: any) => f.code === val)
 
-                                <SearchableCombobox
-                                    multiple={false}
-                                    required
-                                    showCode
-                                    autoHighlight
-                                    className="w-full"
-                                    items={farms}
-                                    value={header?.soldTo || ''}
-                                    onValueChange={(val) => {
-                                        const selectedFarm = farms.find((f: any) => f.code === val)
+                                    setHeader(h => ({
+                                        ...(h ?? emptyApprovalRecord),
+                                        soldTo: val,
+                                        tin: selectedFarm?.tin || '',
+                                        address: selectedFarm?.address || '',
+                                    }))
+                                }}
 
-                                        setHeader(h => ({
-                                            ...(h ?? emptyApprovalRecord),
-                                            soldTo: val,
-                                            tin: selectedFarm?.tin || '',
-                                            address: selectedFarm?.address || '',
-                                        }))
-                                    }}
-
-                                />
-                            </div>
+                            />
                         </div>
                         {headerFieldsLeft.map((field, i) => (
-                            <div key={i} className="flex items-center gap-4 w-full md:max-w-[400px]">
-                                <Label className="text-sm font-medium w-27 shrink-0 text-right">
+                            <div key={i} className="space-y-2">
+                                <Label required={field.required} className="text-sm font-medium text-foreground">
                                     {field.label}
                                 </Label>
 
@@ -565,7 +571,7 @@ export default function ApprovalDecisionForm() {
                                     type={field.type || 'text'}
                                     value={field.value}
                                     onChange={e => field.onChange?.(e.target.value)}
-                                    className="h-9 text-sm w-full md:max-w-[300px]"
+                                    className="w-full"
                                 />
                             </div>
                         ))}
@@ -573,14 +579,15 @@ export default function ApprovalDecisionForm() {
 
                     <Separator className='my-2' />
 
-                    <div className="sm:grid md:grid-cols-2 lg:grid-cols-3 sm:grid-cols-1 gap-6">
-                        <div className='mt-1'>
-                            <Label className="text-sm font-medium w-27 shrink-0 text-right">
+                    <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
+                        <div className='space-y-2'>
+                            <Label className="text-sm font-medium text-foreground">
                                 Shipped To
                             </Label>
                             <DefaultFarmComboBox
                                 value={header?.delivered_to ?? undefined}
                                 valueKey="id"
+                                farmType="HA"
                                 setValue={(val) => {
                                     const deliveredTo = val === '' ? null : Number(val)
 
@@ -599,8 +606,8 @@ export default function ApprovalDecisionForm() {
                         </div>
 
                         {headerFieldsRight.map((field, i) => (
-                            <div key={i} className='mt-1'>
-                                <Label required={field.required} className='pb-2 mt-1'>{field.label}</Label>
+                            <div key={i} className='space-y-2'>
+                                <Label required={field.required} className='text-sm font-medium text-foreground'>{field.label}</Label>
                                 <Input
                                     required={field.required}
                                     disabled={field.disabled}
@@ -611,8 +618,8 @@ export default function ApprovalDecisionForm() {
                             </div>
                         ))}
 
-                        <div className='mt-1'>
-                            <Label className='pb-2' required>Breed</Label>
+                        <div className='space-y-2'>
+                            <Label className='text-sm font-medium text-foreground' required>Breed</Label>
                             <Input
                                 required
                                 value={headerBreed}

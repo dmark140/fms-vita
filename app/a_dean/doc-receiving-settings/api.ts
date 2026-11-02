@@ -1,0 +1,166 @@
+import { db } from '@/lib/Supabase/supabaseClient'
+
+export type DocItemOption = {
+  id: number
+  item_code: string
+  item_name: string | null
+}
+
+export type DocReceivingSettings = {
+  id?: number
+  farm_id: number
+  good_doc: number | null
+  bad_doc: number | null
+  reject_doc: number | null
+  suppress_seven_day_placement_condition: boolean
+  void?: string
+  created_at?: string
+  updated_at?: string | null
+}
+
+export type DocCycleExcludedBuilding = {
+  building_whse_id: number
+  do_not_format_cycle_number: boolean | null
+}
+
+export type DocCycleExcludedBuildingSetting = {
+  buildingWarehouseId: number
+  doNotFormatCycleNumber: boolean
+}
+
+export async function getDocItemOptions() {
+  const { data, error } = await db
+    .from('items')
+    .select('id, item_code, item_name')
+    .eq('void', 1)
+    .eq('fms_group', 'broiler')
+    .eq('item_group', 'DOC')
+    .order('item_code', { ascending: true })
+
+  if (error) throw error
+  return (data || []) as DocItemOption[]
+}
+
+export async function getDocReceivingSettings(
+  farmId: number,
+  options: { usePreviousFarmDefaults?: boolean } = {},
+) {
+  if (!Number.isFinite(farmId) || farmId <= 0) return null
+
+  const { data, error } = await db
+    .from('doc_rec_settings')
+    .select('*')
+    .eq('void', '1')
+    .eq('farm_id', farmId)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle()
+
+  if (error) throw error
+  if (data || !options.usePreviousFarmDefaults) {
+    return data as DocReceivingSettings | null
+  }
+
+  const { data: previous, error: previousError } = await db
+    .from('doc_rec_settings')
+    .select('*')
+    .eq('void', '1')
+    .lt('farm_id', farmId)
+    .order('farm_id', { ascending: false })
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle()
+
+  if (previousError) throw previousError
+  if (!previous) return null
+
+  return {
+    ...(previous as DocReceivingSettings),
+    id: undefined,
+    farm_id: farmId,
+    created_at: undefined,
+    updated_at: undefined,
+  }
+}
+
+export async function addDocReceivingSettings(payload: DocReceivingSettings) {
+  const farmId = Number(payload.farm_id)
+  if (!Number.isFinite(farmId) || farmId <= 0) throw new Error('Please select a farm.')
+
+  const { data: authData } = await db.auth.getUser()
+  const { data, error } = await db
+    .from('doc_rec_settings')
+    .insert({
+      farm_id: farmId,
+      good_doc: payload.good_doc,
+      bad_doc: payload.bad_doc,
+      reject_doc: payload.reject_doc,
+      suppress_seven_day_placement_condition: payload.suppress_seven_day_placement_condition,
+      created_by: authData.user?.id || null,
+      void: '1',
+    })
+    .select()
+    .single()
+
+  if (error) throw error
+  return data as DocReceivingSettings
+}
+
+export async function updateDocReceivingSettings(id: number, payload: DocReceivingSettings) {
+  const farmId = Number(payload.farm_id)
+  if (!Number.isFinite(farmId) || farmId <= 0) throw new Error('Please select a farm.')
+
+  const { data: authData } = await db.auth.getUser()
+  const { data, error } = await db
+    .from('doc_rec_settings')
+    .update({
+      farm_id: farmId,
+      good_doc: payload.good_doc,
+      bad_doc: payload.bad_doc,
+      reject_doc: payload.reject_doc,
+      suppress_seven_day_placement_condition: payload.suppress_seven_day_placement_condition,
+      updated_by: authData.user?.id || null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', id)
+    .eq('farm_id', farmId)
+    .select()
+    .single()
+
+  if (error) throw error
+  return data as DocReceivingSettings
+}
+
+export async function getDocCycleExcludedBuildingSettings(farmId: number): Promise<DocCycleExcludedBuildingSetting[]> {
+  if (!Number.isFinite(farmId) || farmId <= 0) return []
+  const { data, error } = await db
+    .from('doc_cycle_excluded_buildings')
+    .select('building_whse_id, do_not_format_cycle_number')
+    .eq('farm_id', farmId)
+  if (error) throw error
+  return (data as DocCycleExcludedBuilding[]).map(row => ({
+    buildingWarehouseId: Number(row.building_whse_id),
+    doNotFormatCycleNumber: Boolean(row.do_not_format_cycle_number),
+  }))
+}
+
+export async function saveDocCycleExcludedBuildingSettings(
+  farmId: number,
+  settings: DocCycleExcludedBuildingSetting[],
+) {
+  const { error } = await db.rpc('save_doc_cycle_excluded_building_settings', {
+    p_farm_id: farmId,
+    p_buildings: settings.map(setting => ({
+      building_whse_id: setting.buildingWarehouseId,
+      do_not_format_cycle_number: setting.doNotFormatCycleNumber,
+    })),
+  })
+  if (error) throw error
+  const savedSettings = await getDocCycleExcludedBuildingSettings(farmId)
+  const requested = new Map(settings.map(setting => [setting.buildingWarehouseId, setting.doNotFormatCycleNumber]))
+  if (savedSettings.length !== requested.size || savedSettings.some(setting =>
+    requested.get(setting.buildingWarehouseId) !== setting.doNotFormatCycleNumber)) {
+    throw new Error('Excluded Cycle Buildings did not match the requested selection after saving. Refresh the settings and try again. If this continues, the database save function or access policies need to be checked.')
+  }
+  return savedSettings
+}

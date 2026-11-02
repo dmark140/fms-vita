@@ -1,0 +1,706 @@
+'use client'
+
+import { saveBroilerCleanup } from '@/lib/data/repositories/brCleanup'
+import { loadBroilerIssueCycles } from '@/lib/data/repositories/broilerIssueCycles'
+import { getPostgresErrorMessage } from '@/lib/data/errors/postgres'
+import { quantityExceeds } from '@/lib/utils/quantityComparison'
+
+import { db } from '@/lib/Supabase/supabaseClient'
+
+export type GoodsIssueStatus = 'Draft' | 'Posted' | 'Cancelled'
+
+export type GoodsIssueLine = {
+  flockCardId?: number | null
+  flockCardNo?: string | null
+  cycleNumber?: string | null
+  cycleMask?: string | null
+  id: number | string
+  allocationGroupKey?: string
+  averageLiveWeight?: number | null
+  netLiveWeight?: number | null
+  harvestAge?: number | null
+  tsDrNo?: string
+  deliveredDate?: string
+  haulerName?: string
+  plateNumber?: string
+  destination?: string
+  liveSalesCustomerName?: string
+  truckSeal?: number | null
+  itemId: number | null
+  itemCode: string
+  description: string
+  lineRemarks?: string
+  batchRuleId: number | null
+  batchNumber: string
+  manufacturingDate: string
+  expiryDate: string
+  altQty: number
+  altUom: string
+  baseQty: number
+  baseUom: string
+  fromWarehouseId: number | null
+  fromWarehouseCode: string
+  fromWarehouseName: string
+  onHandQty: number
+  requestedAltQty?: number
+  batchTotalQty?: number
+  varianceQty?: number
+}
+
+export type GoodsIssue = {
+  id: number | null
+  giNo: string
+  triggeredBy: string
+  issueDate: string
+  farmId: number | null
+  farmCycleId: number | null
+  farmCycleMask: string
+  farmCode: string
+  farmName: string
+  fromWarehouseId: number | null
+  fromWarehouseCode: string
+  fromWarehouseName: string
+  remarks: string
+  haulerName: string
+  plateNumber: string | null
+  truckSeal: number | null
+  destination: string
+  liveSalesCustomerName: string
+  status: GoodsIssueStatus
+  lines: GoodsIssueLine[]
+  createdAt: string
+  createdBy: string | null
+}
+
+type GoodsIssueRow = {
+  id: number
+  gi_no: string
+  issue_date: string
+  farm_id: number | null
+  farm_cycle_id?: number | null
+  farm_code: string | null
+  farm_name: string | null
+  from_warehouse_id: number | null
+  from_warehouse_code: string | null
+  from_warehouse_name: string | null
+  triggered_by: string | null
+  remarks: string | null
+  hauler_name?: string | null
+  plate_number?: string | null
+  truck_seal?: number | null
+  destination?: string | null
+  live_sales_customer_name?: string | null
+  status: GoodsIssueStatus
+  created_at: string
+  created_by: string | null
+}
+
+type GoodsIssueItemRow = {
+  id: number
+  goods_issue_id: number
+  br_delivery_id?: number
+  br_cleanup_id?: number
+  item_id: number | null
+  item_code: string
+  description: string | null
+  remarks?: string | null
+  batch_total_qty?: number | null
+  variance_qty?: number | null
+  batch_rule_id: number | null
+  batch_number: string | null
+  manufacturing_date: string | null
+  expiry_date: string | null
+  alt_qty: number
+  alt_uom: string
+  base_qty: number
+  base_uom: string
+  from_warehouse_id: number | null
+  from_warehouse_code: string | null
+  from_warehouse_name: string | null
+  void: string
+  allocation_group_key?: string | null
+  average_live_weight?: number | null
+  net_live_weight?: number | null
+  harvest_age?: number | null
+  ts_dr_no?: string | null
+  delivered_date?: string | null
+  hauler_name?: string | null
+  plate_number?: string | null
+  destination?: string | null
+  live_sales_customer_name?: string | null
+  truck_seal?: number | null
+}
+
+type GoodsIssueListItemRow = {
+  goods_issue_id?: number
+  br_delivery_id?: number
+  br_cleanup_id?: number
+  item_code: string
+  description: string | null
+  base_qty: number
+}
+
+export type GoodsIssueOnHandBatch = {
+  itemCode: string
+  warehouseCode: string
+  batchNumber: string
+  manufacturingDate: string
+  expiryDate: string
+  onHandQty: number
+}
+
+export type GoodsIssueOnHandShortage = {
+  itemCode: string
+  warehouseCode: string
+  batchNumber: string
+  requiredQty: number
+  onHandQty: number
+}
+
+type InventoryPostingRow = {
+  id: number
+  item_code: string | null
+  warehouse_code: string | null
+  qty: number | null
+  transfer_type: string | null
+  ref: string | null
+  ref2: string | null
+  batch_number?: string | null
+}
+
+export type CleanupVariancePosting = {
+  id: number
+  itemCode: string
+  warehouseCode: string
+  batchNumber: string
+  qty: number
+}
+
+const dedicatedIssueTables = {
+  'BR-DR': { header: 'br_delivery', lines: 'br_delivery_lines', lineForeignKey: 'br_delivery_id' },
+  'BR-CU': { header: 'br_cleanup', lines: 'br_cleanup_lines', lineForeignKey: 'br_cleanup_id' },
+} as const
+
+const getIssueTables = (triggeredBy: string) =>
+  dedicatedIssueTables[triggeredBy.trim().toUpperCase() as keyof typeof dedicatedIssueTables]
+  ?? { header: 'goods_issue', lines: 'goods_issue_items', lineForeignKey: 'goods_issue_id' }
+
+const usesDedicatedIssueTables = (triggeredBy: string) =>
+  triggeredBy.trim().toUpperCase() in dedicatedIssueTables
+
+const getListLineHeaderId = (row: GoodsIssueListItemRow) =>
+  Number(row.br_delivery_id ?? row.br_cleanup_id ?? row.goods_issue_id ?? 0)
+
+type ItemBatchRow = {
+  item_code: string
+  batch_number: string
+  manufacturing_date: string | null
+  expiry_date: string | null
+}
+
+function errorDetails(error: unknown) {
+  return typeof error === 'object' && error !== null
+    ? JSON.stringify(error)
+    : String(error)
+}
+
+const toIssueLine = (row: GoodsIssueItemRow, legacyHeader?: GoodsIssueRow): GoodsIssueLine => ({
+  id: row.id,
+  allocationGroupKey: row.allocation_group_key?.trim() || (
+    row.br_delivery_id
+      ? `legacy:${row.br_delivery_id}:${String(row.from_warehouse_code ?? '').trim().toUpperCase()}:${row.item_code.trim().toUpperCase()}`
+      : `line:${row.id}`
+  ),
+  averageLiveWeight: row.average_live_weight == null ? undefined : Number(row.average_live_weight),
+  netLiveWeight: row.net_live_weight == null ? null : Number(row.net_live_weight),
+  harvestAge: row.harvest_age == null ? null : Number(row.harvest_age),
+  tsDrNo: row.ts_dr_no ?? '',
+  deliveredDate: row.delivered_date ?? legacyHeader?.issue_date ?? '',
+  haulerName: row.hauler_name ?? legacyHeader?.hauler_name ?? '',
+  plateNumber: row.plate_number ?? legacyHeader?.plate_number ?? '',
+  destination: row.destination ?? legacyHeader?.destination ?? '',
+  liveSalesCustomerName: row.live_sales_customer_name ?? legacyHeader?.live_sales_customer_name ?? '',
+  truckSeal: row.truck_seal ?? legacyHeader?.truck_seal ?? null,
+  itemId: row.item_id,
+  itemCode: row.item_code,
+  description: row.description ?? '',
+  lineRemarks: row.remarks ?? '',
+  batchRuleId: row.batch_rule_id ?? null,
+  batchNumber: row.batch_number ?? '',
+  manufacturingDate: row.manufacturing_date ?? '',
+  expiryDate: row.expiry_date ?? '',
+  altQty: Number(row.alt_qty),
+  altUom: row.alt_uom,
+  baseQty: Number(row.base_qty),
+  baseUom: row.base_uom,
+  fromWarehouseId: row.from_warehouse_id,
+  fromWarehouseCode: row.from_warehouse_code ?? '',
+  fromWarehouseName: row.from_warehouse_name ?? '',
+  onHandQty: 0,
+  batchTotalQty: Number(row.batch_total_qty ?? 0),
+  varianceQty: Number(row.variance_qty ?? 0),
+})
+
+const toIssue = (row: GoodsIssueRow, lines: GoodsIssueItemRow[]): GoodsIssue => ({
+  id: row.id,
+  giNo: row.gi_no,
+  triggeredBy: row.triggered_by ?? 'GI',
+  issueDate: row.issue_date,
+  farmId: row.farm_id,
+  farmCycleId: row.farm_cycle_id ?? null,
+  farmCycleMask: '',
+  farmCode: row.farm_code ?? '',
+  farmName: row.farm_name ?? '',
+  fromWarehouseId: row.from_warehouse_id,
+  fromWarehouseCode: row.from_warehouse_code ?? '',
+  fromWarehouseName: row.from_warehouse_name ?? '',
+  remarks: row.remarks ?? '',
+  haulerName: row.hauler_name ?? '',
+  plateNumber: row.plate_number == null ? null : String(row.plate_number),
+  truckSeal: row.truck_seal == null ? null : Number(row.truck_seal),
+  destination: row.destination ?? '',
+  liveSalesCustomerName: row.live_sales_customer_name ?? '',
+  status: row.status,
+  lines: lines.map(line => toIssueLine(line, row)),
+  createdAt: row.created_at,
+  createdBy: row.created_by,
+})
+
+const toIssueListLine = (row: GoodsIssueListItemRow): GoodsIssueLine => ({
+  id: `${getListLineHeaderId(row)}-${row.item_code}`,
+  allocationGroupKey: `list:${getListLineHeaderId(row)}:${row.item_code}`,
+  tsDrNo: '',
+  itemId: null,
+  itemCode: row.item_code,
+  description: row.description ?? '',
+  lineRemarks: '',
+  batchRuleId: null,
+  batchNumber: '',
+  manufacturingDate: '',
+  expiryDate: '',
+  altQty: 0,
+  altUom: '',
+  baseQty: Number(row.base_qty),
+  baseUom: '',
+  fromWarehouseId: null,
+  fromWarehouseCode: '',
+  fromWarehouseName: '',
+  onHandQty: 0,
+  batchTotalQty: 0,
+  varianceQty: 0,
+})
+
+const toIssueListItem = (
+  row: GoodsIssueRow,
+  lines: GoodsIssueListItemRow[],
+): GoodsIssue => ({
+  ...toIssue(row, []),
+  lines: lines.map(toIssueListLine),
+})
+
+async function getSessionUserId() {
+  const { data, error } = await db.auth.getSession()
+  if (error) throw error
+  return data.session?.user.id ?? null
+}
+
+function signedQty(row: InventoryPostingRow) {
+  const qty = Number(row.qty ?? 0)
+  return row.transfer_type === 'OUT' ? -qty : qty
+}
+
+const inventoryRequirementKey = (line: GoodsIssueLine) =>
+  [
+    line.itemCode,
+    line.fromWarehouseCode,
+    line.batchNumber || '',
+  ].map(value => value.trim().toUpperCase()).join('|')
+
+function getRequiredInventoryQuantities(lines: GoodsIssueLine[]) {
+  const requiredByKey = new Map<string, GoodsIssueOnHandShortage>()
+
+  for (const line of lines) {
+    const requiredQty = Number(line.baseQty || 0)
+    if (!line.itemCode || !line.fromWarehouseCode || requiredQty <= 0) continue
+
+    const key = inventoryRequirementKey(line)
+    const current = requiredByKey.get(key)
+
+    if (current) {
+      current.requiredQty += requiredQty
+      continue
+    }
+
+    requiredByKey.set(key, {
+      itemCode: line.itemCode.trim(),
+      warehouseCode: line.fromWarehouseCode.trim(),
+      batchNumber: line.batchNumber.trim(),
+      requiredQty,
+      onHandQty: 0,
+    })
+  }
+
+  return Array.from(requiredByKey.values())
+}
+
+export async function getItemWarehouseOnHand(
+  itemCode: string,
+  warehouseCode: string,
+  batchNumber?: string,
+) {
+  if (!itemCode || !warehouseCode) return 0
+
+  const postingSelect = 'id, item_code, warehouse_code, qty, transfer_type, batch_number, ref'
+  const buildQuery = () => db
+    .from('inventory_postings')
+    .select(postingSelect)
+    .eq('item_code', itemCode)
+    .eq('warehouse_code', warehouseCode)
+
+  const results = batchNumber
+    ? await Promise.all([
+        buildQuery().eq('batch_number', batchNumber),
+        buildQuery().eq('ref', batchNumber),
+      ])
+    : [await buildQuery()]
+
+  for (const result of results) {
+    if (result.error) throw result.error
+  }
+
+  const seenPostingIds = new Set<number>()
+  const rows = results.flatMap(result => (result.data ?? []) as InventoryPostingRow[])
+
+  return rows.reduce(
+    (total, row) => {
+      if (seenPostingIds.has(row.id)) return total
+      seenPostingIds.add(row.id)
+      return total + signedQty(row)
+    },
+    0,
+  )
+}
+
+export async function getOnHandBatches(
+  itemCode: string,
+  warehouseCode: string,
+): Promise<GoodsIssueOnHandBatch[]> {
+  if (!itemCode || !warehouseCode) return []
+
+  const { data: postingRows, error: postingError } = await db
+    .from('inventory_postings')
+    .select('item_code, warehouse_code, qty, transfer_type, batch_number, ref')
+    .eq('item_code', itemCode)
+    .eq('warehouse_code', warehouseCode)
+
+  if (postingError) throw postingError
+
+  const quantityByBatch = new Map<string, number>()
+  for (const row of (postingRows ?? []) as InventoryPostingRow[]) {
+    const batchNumber = String(row.batch_number ?? row.ref ?? '').trim()
+    if (!batchNumber) continue
+    quantityByBatch.set(batchNumber, (quantityByBatch.get(batchNumber) ?? 0) + signedQty(row))
+  }
+
+  const batchNumbers = Array.from(quantityByBatch.entries())
+    .filter(([, qty]) => qty > 0)
+    .map(([batchNumber]) => batchNumber)
+
+  if (batchNumbers.length === 0) return []
+
+  const { data: batchRows, error: batchError } = await db
+    .from('item_batches')
+    .select('item_code, batch_number, manufacturing_date, expiry_date')
+    .eq('item_code', itemCode)
+    .eq('void', '1')
+    .in('batch_number', batchNumbers)
+
+  if (batchError) throw batchError
+
+  const batchDateByNumber = new Map(
+    ((batchRows ?? []) as ItemBatchRow[]).map(row => [row.batch_number, row]),
+  )
+
+  return batchNumbers
+    .map(batchNumber => {
+      const batch = batchDateByNumber.get(batchNumber)
+      return {
+        itemCode,
+        warehouseCode,
+        batchNumber,
+        manufacturingDate: batch?.manufacturing_date ?? '',
+        expiryDate: batch?.expiry_date ?? '',
+        onHandQty: quantityByBatch.get(batchNumber) ?? 0,
+      }
+    })
+    .sort((left, right) => {
+      const leftDate = left.expiryDate || '9999-12-31'
+      const rightDate = right.expiryDate || '9999-12-31'
+      return leftDate.localeCompare(rightDate) || left.batchNumber.localeCompare(right.batchNumber)
+    })
+}
+
+export async function getGoodsIssueOnHandShortages(
+  lines: GoodsIssueLine[],
+): Promise<GoodsIssueOnHandShortage[]> {
+  const requirements = getRequiredInventoryQuantities(lines)
+
+  const checkedRequirements = await Promise.all(
+    requirements.map(async requirement => ({
+      ...requirement,
+      onHandQty: await getItemWarehouseOnHand(
+        requirement.itemCode,
+        requirement.warehouseCode,
+        requirement.batchNumber || undefined,
+      ),
+    })),
+  )
+
+  return checkedRequirements.filter(
+    requirement => quantityExceeds(requirement.requiredQty, requirement.onHandQty),
+  )
+}
+
+type GetGoodsIssuesOptions = {
+  limit?: number
+  triggeredBy?: string
+  farmIdentifier?: number | string | null
+  dateFrom?: string
+  dateTo?: string
+}
+
+export async function getGoodsIssues({
+  limit = 50,
+  triggeredBy = 'GI',
+  farmIdentifier,
+  dateFrom,
+  dateTo,
+}: GetGoodsIssuesOptions = {}): Promise<GoodsIssue[]> {
+  const tables = getIssueTables(triggeredBy)
+  let query = db
+    .from(tables.header)
+    .select('*')
+    .order('created_at', { ascending: false })
+    .limit(limit)
+
+  if (!usesDedicatedIssueTables(triggeredBy)) query = query.eq('triggered_by', triggeredBy)
+
+  if (
+    farmIdentifier !== null &&
+    farmIdentifier !== undefined &&
+    String(farmIdentifier).trim() !== ''
+  ) {
+    const farmValue = String(farmIdentifier).trim()
+    query = /^\d+$/.test(farmValue)
+      ? query.eq('farm_id', farmValue)
+      : query.eq('farm_code', farmValue)
+  }
+
+  if (dateFrom) query = query.gte('issue_date', dateFrom)
+  if (dateTo) query = query.lte('issue_date', dateTo)
+
+  const { data: issueRows, error: issueError } = await query
+
+  if (issueError) throw issueError
+
+  const issues = (issueRows ?? []) as GoodsIssueRow[]
+  const issueIds = issues.map(issue => issue.id)
+  if (issueIds.length === 0) return []
+
+  const { data: itemRows, error: itemError } = await db
+    .from(tables.lines)
+    .select('*')
+    .in(tables.lineForeignKey, issueIds)
+    .eq('void', '1')
+    .order('line_no', { ascending: true })
+
+  if (itemError) throw itemError
+
+  if (usesDedicatedIssueTables(triggeredBy)) {
+    const items = (itemRows ?? []) as GoodsIssueItemRow[]
+    return loadBroilerIssueCycles(issues.map(issue =>
+      toIssue(issue, items.filter(item => Number(item.br_delivery_id ?? item.br_cleanup_id) === issue.id)),
+    ))
+  }
+  const items = (itemRows ?? []) as GoodsIssueListItemRow[]
+  return issues.map(issue =>
+    toIssueListItem(issue, items.filter(item => getListLineHeaderId(item) === issue.id)),
+  )
+}
+
+export async function getGoodsIssueById(id: number, triggeredBy = 'GI'): Promise<GoodsIssue | null> {
+  const tables = getIssueTables(triggeredBy)
+  const { data: issueRow, error: issueError } = await db
+    .from(tables.header)
+    .select('*')
+    .eq('id', id)
+    .maybeSingle()
+
+  if (issueError) throw issueError
+  if (!issueRow) return null
+
+  const { data: itemRows, error: itemError } = await db
+    .from(tables.lines)
+    .select('*')
+    .eq(tables.lineForeignKey, id)
+    .eq('void', '1')
+    .order('line_no', { ascending: true })
+
+  if (itemError) throw itemError
+
+  const issue = toIssue(issueRow as GoodsIssueRow, (itemRows ?? []) as GoodsIssueItemRow[])
+  return usesDedicatedIssueTables(triggeredBy) ? (await loadBroilerIssueCycles([issue]))[0] : issue
+}
+
+async function validateOnHand(lines: GoodsIssueLine[]) {
+  const [shortage] = await getGoodsIssueOnHandShortages(lines)
+  if (!shortage) return
+
+  const batchText = shortage.batchNumber ? ` batch ${shortage.batchNumber}` : ''
+  throw new Error(
+    `${shortage.itemCode}${batchText} has only ${shortage.onHandQty} on hand in ${shortage.warehouseCode}.`,
+  )
+}
+
+type GoodsIssueTransactionResult = {
+  header: GoodsIssueRow
+  lines: GoodsIssueItemRow[]
+}
+
+async function saveBrDeliveryTransaction(issue: GoodsIssue): Promise<GoodsIssue> {
+  const userId = await getSessionUserId()
+  if (!userId) {
+    throw new Error('Your session expired. Please sign in again before saving Harvest & Delivery.')
+  }
+
+  const { data, error } = await db.rpc('save_br_delivery_transaction', {
+    p_document: {
+      id: issue.id,
+      giNo: issue.giNo,
+      issueDate: issue.issueDate,
+      farmId: issue.farmId,
+      farmCycleId: issue.farmCycleId,
+      fromWarehouseId: issue.fromWarehouseId,
+      fromWarehouseCode: issue.fromWarehouseCode,
+      fromWarehouseName: issue.fromWarehouseName,
+      remarks: issue.remarks,
+      status: issue.status,
+      lines: issue.lines,
+    },
+  })
+
+  if (error) {
+    if (error.code === 'PGRST202' || error.code === '42883') {
+      throw new Error(
+        'Harvest & Delivery database save is not deployed. Apply app/sql/updated/save_br_delivery_transaction.sql to the same Supabase project used by this app, then retry.',
+      )
+    }
+    if (error.code === '42501' && error.message.includes('save_br_delivery_transaction')) {
+      throw new Error(
+        'Harvest & Delivery database access is not enabled for authenticated users. Apply the RPC execute grant to the same Supabase project used by this app.',
+      )
+    }
+    throw new Error(getPostgresErrorMessage(error, 'Unable to save Harvest & Delivery.'))
+  }
+  const result = data as GoodsIssueTransactionResult | null
+  if (!result?.header || !Array.isArray(result.lines)) {
+    throw new Error('Harvest & Delivery transaction did not return the saved document.')
+  }
+
+  return toIssue(result.header, result.lines)
+}
+
+export async function saveGoodsIssue(issue: GoodsIssue) {
+  if (issue.triggeredBy.trim().toUpperCase() === 'BR-CU') {
+    const result = await saveBroilerCleanup(issue)
+    if (!result?.header || !Array.isArray(result.lines)) throw new Error('Clean Up transaction did not return the saved document.')
+    return toIssue(result.header as GoodsIssueRow, result.lines as GoodsIssueItemRow[])
+  }
+  if (issue.triggeredBy.trim().toUpperCase() === 'BR-DR') {
+    return saveBrDeliveryTransaction(issue)
+  }
+
+  if (issue.status === 'Posted') await validateOnHand(issue.lines)
+
+  const { data, error } = await db.rpc('save_goods_issue_transaction', {
+    p_document: {
+      id: issue.id,
+      issueDate: issue.issueDate,
+      farmId: issue.farmId,
+      fromWarehouseId: issue.fromWarehouseId,
+      fromWarehouseCode: issue.fromWarehouseCode,
+      fromWarehouseName: issue.fromWarehouseName,
+      remarks: issue.remarks,
+      status: issue.status,
+      lines: issue.lines,
+    },
+  })
+
+  if (error) {
+    if (error.code === 'PGRST202' || error.code === '42883') {
+      throw new Error(
+        'Item Stock Out database save is not deployed. Apply app/sql/new/save_goods_issue_transaction.sql to the same Supabase project used by this app.',
+      )
+    }
+    throw error
+  }
+
+  const result = data as GoodsIssueTransactionResult | null
+  if (!result?.header || !Array.isArray(result.lines)) {
+    throw new Error('Item Stock Out transaction did not return the saved document.')
+  }
+
+  return toIssue(result.header, result.lines)
+}
+
+export async function getCleanupVariancePostings(documentId: number): Promise<CleanupVariancePosting[]> {
+  if (!Number.isFinite(documentId) || documentId <= 0) return []
+
+  const { data, error } = await db
+    .from('inventory_postings')
+    .select('id, item_code, warehouse_code, batch_number, ref, qty')
+    .eq('source_doc_type', 'BR_CLEANUP_VARIANCE')
+    .eq('source_docentry', documentId)
+    .eq('transfer_type', 'OUT')
+    .order('id', { ascending: true })
+
+  if (error) throw error
+  return (data ?? []).map(row => ({
+    id: Number(row.id),
+    itemCode: String(row.item_code ?? ''),
+    warehouseCode: String(row.warehouse_code ?? ''),
+    batchNumber: String(row.batch_number ?? row.ref ?? ''),
+    qty: Number(row.qty ?? 0),
+  }))
+}
+
+export async function createGoodsIssueNumber(prefix = 'GI') {
+  const yearSuffix = String(new Date().getFullYear()).slice(-2)
+  const documentPrefix = prefix.trim() || 'GI'
+
+  const tables = getIssueTables(documentPrefix)
+  const { data, error } = await db
+    .from(tables.header)
+    .select('gi_no')
+    .ilike('gi_no', `${documentPrefix}-${yearSuffix}-%`)
+    .order('gi_no', { ascending: false })
+    .limit(1)
+
+  if (error) throw new Error(`Item stock out number could not be created. ${errorDetails(error)}`)
+
+  const latestNo = data?.[0]?.gi_no ?? ''
+  const latestSequence = Number(latestNo.match(/(\d+)$/)?.[1] ?? 0)
+  const sequence = Number.isFinite(latestSequence) ? latestSequence + 1 : 1
+
+  return `${documentPrefix}-${yearSuffix}-${String(sequence).padStart(6, '0')}`
+}
+
+export function getIssueItemSummary(issue: GoodsIssue) {
+  const descriptions = issue.lines
+    .filter(line => line.itemCode)
+    .map(line => line.description || line.itemCode)
+
+  if (descriptions.length === 0) return '-'
+  if (descriptions.length === 1) return descriptions[0]
+  return `${descriptions[0]} +${descriptions.length - 1} more`
+}

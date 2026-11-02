@@ -56,13 +56,13 @@ import { RowAction } from "@/lib/types";
 import { copyRow, copyTable } from "@/lib/tableActions";
 
 import { usePermission } from "@/hooks/usePermission";
+import { getErrorMessage } from "@/lib/errorMessage";
 
 import { useGlobalContext } from "@/lib/context/GlobalContext";
-import UserFarmSearchCombobox from "@/components/ui/UserFarmSearchCombobox";
 import {
-  attachFarmFilterFromRefs,
   FARM_FILTER_KEY,
 } from "@/lib/farmFilter";
+import HatcheryListParameters, { isWithinHatcheryDateRange, useHatcheryListParameters } from "@/components/hatchery/HatcheryListParameters";
 
 function hasValue(value: unknown) {
   return value !== null && value !== undefined && value !== "";
@@ -77,10 +77,7 @@ function buildDefaultFarmColumnFilter(defaultFarmId: unknown): ColumnFiltersStat
 function withDefaultFarmColumnFilter(
   filters: ColumnFiltersState,
   defaultFarmId: unknown,
-  farmFilterTouched: boolean,
 ): ColumnFiltersState {
-  if (farmFilterTouched) return filters;
-
   if (!hasValue(defaultFarmId)) {
     return filters.filter((filter) => filter.id !== FARM_FILTER_KEY);
   }
@@ -128,12 +125,12 @@ export default function ChickgradingTable() {
 
   const [items, setItems] = useState<DocClassificationRow[]>([]);
   const [sorting, setSorting] = useState<SortingState>([]);
-  const { getValue, setValue } = useGlobalContext();
-  const defaultFarmId = getValue("DefaultFarmId");
+  const { setValue } = useGlobalContext();
+  const parameters = useHatcheryListParameters();
+  const defaultFarmId = parameters.farmId;
   const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>(() =>
     buildDefaultFarmColumnFilter(defaultFarmId),
   );
-  const [farmFilterTouched, setFarmFilterTouched] = useState(false);
   const [columnVisibility, setColumnVisibility] = useState<VisibilityState>({
     [FARM_FILTER_KEY]: false,
   });
@@ -141,15 +138,15 @@ export default function ChickgradingTable() {
 
   const [isLoading, setIsLoading] =
     useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const effectiveColumnFilters = useMemo(
     () =>
       withDefaultFarmColumnFilter(
         columnFilters,
         defaultFarmId,
-        farmFilterTouched,
       ),
-    [columnFilters, defaultFarmId, farmFilterTouched],
+    [columnFilters, defaultFarmId],
   );
 
   const canView = usePermission(
@@ -166,6 +163,7 @@ export default function ChickgradingTable() {
 
   const load = useCallback(async () => {
     setIsLoading(true);
+    setLoadError(null);
 
     try {
       const data =
@@ -173,67 +171,68 @@ export default function ChickgradingTable() {
 
       const mapped =
         Array.isArray(data)
-          ? data.map(
-              (
-                item: ChickGradingProcess,
-              ) => ({
-                id: Number(item.id),
+          ? data.filter(item => isWithinHatcheryDateRange(item.grading_datetime, parameters.dateFrom, parameters.dateTo)).map(
+            (
+              item: ChickGradingProcess,
+            ) => ({
+              id: Number(item.id),
 
-                egg_ref_no:
-                  item.egg_ref_no || "-",
+              [FARM_FILTER_KEY]:
+                item.farm_id == null
+                  ? ""
+                  : String(item.farm_id),
+                  
+              egg_ref_no:
+                item.egg_ref_no || "-",
 
-                batch_code:
-                  item.batch_code || "-",
+              batch_code:
+                item.batch_code || "-",
 
-                grading_datetime:
-                  fmtDateTime(
-                    item.grading_datetime,
-                  ),
+              grading_datetime:
+                fmtDateTime(
+                  item.grading_datetime,
+                ),
 
-                total_chicks:
-                  Number(
-                    item.total_chicks || 0,
-                  ),
+              total_chicks:
+                Number(
+                  item.total_egg_set || 0,
+                ),
 
-                good_quality_chicks:
-                  Number(
-                    item.good_quality_chicks ||
-                      0,
-                  ),
+              good_quality_chicks:
+                Number(
+                  item.good_quality_chicks ||
+                  0,
+                ),
 
-                quality_grade_rate:
-                  item.quality_grade_rate === null ||
+              quality_grade_rate:
+                item.quality_grade_rate === null ||
                   item.quality_grade_rate === undefined
-                    ? "-"
-                    : String(item.quality_grade_rate),
+                  ? "-"
+                  : String(item.quality_grade_rate),
 
-                cull_rate:
-                  item.cull_rate === null ||
+              cull_rate:
+                item.cull_rate === null ||
                   item.cull_rate === undefined
-                    ? "-"
-                    : String(item.cull_rate),
+                  ? "-"
+                  : String(item.cull_rate),
 
-                grading_personnel:
-                  item.grading_personnel ||
-                  "-",
-              }),
-            )
+              grading_personnel:
+                item.grading_personnel ||
+                "-",
+            }),
+          )
           : [];
 
-      setItems(
-        await attachFarmFilterFromRefs(
-          mapped,
-          (row) => row.egg_ref_no,
-        ),
-      );
+      setItems(mapped);
     } catch (e) {
       console.error(e);
 
       setItems([]);
+      setLoadError(getErrorMessage(e, "Unable to load DOC Classification."));
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [parameters.dateFrom, parameters.dateTo]);
 
   useEffect(() => {
     refreshSessionx(router);
@@ -315,7 +314,7 @@ export default function ChickgradingTable() {
         enableSorting: false,
         cell: ({ row, table }) =>
           table.getState().pagination.pageIndex *
-            table.getState().pagination.pageSize +
+          table.getState().pagination.pageSize +
           row.index +
           1,
       },
@@ -431,11 +430,10 @@ export default function ChickgradingTable() {
             className="flex items-center gap-2"
           >
             <RefreshCw
-              className={`size-4 ${
-                isLoading
-                  ? "animate-spin"
-                  : ""
-              }`}
+              className={`size-4 ${isLoading
+                ? "animate-spin"
+                : ""
+                }`}
             />
 
             {isLoading
@@ -460,11 +458,14 @@ export default function ChickgradingTable() {
         </Button>
       </div>
 
+      <HatcheryListParameters {...parameters} />
+
       <ClassificationTableSection
         table={table}
         title="Doc Classification"
         tone="sky"
         isLoading={isLoading}
+        error={loadError}
         colSpan={columns.length}
         paginationMode="showing-rows"
         headerActions={
@@ -480,34 +481,6 @@ export default function ChickgradingTable() {
               }
             />
 
-            <div className="w-full sm:w-72">
-              <UserFarmSearchCombobox
-                label="Farm"
-                value={
-                  (table.getColumn(FARM_FILTER_KEY)?.getFilterValue() as string) ??
-                  ""
-                }
-                onValueChange={(farmId) => {
-                  table
-                    .getColumn(FARM_FILTER_KEY)
-                    ?.setFilterValue(farmId || undefined);
-                  setFarmFilterTouched(true);
-                }}
-              />
-            </div>
-
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="h-9 rounded-md bg-white"
-              onClick={() => {
-                table.getColumn(FARM_FILTER_KEY)?.setFilterValue(undefined);
-                setFarmFilterTouched(true);
-              }}
-            >
-              Clear Farm
-            </Button>
           </div>
         }
       />

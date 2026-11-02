@@ -1,0 +1,292 @@
+import { db } from '@/lib/Supabase/supabaseClient'
+import type { WarehouseData } from '@/lib/types'
+import { getWarehouses } from '../../warehouse/api'
+import { resolveFarmWarehouseAssociations } from '@/lib/data/repositories/farmWarehouseAssociations'
+import { isUniqueConstraintViolation } from '@/lib/data/errors/postgres'
+import { normalizeFarmSetupAddress } from '@/lib/data/farmSetupPersistence'
+import {
+  listFarmAssignableUsers,
+  listFarmAssignedUsers,
+  type FarmAssignableUser,
+} from '@/lib/data/repositories/farmAssignedUsers'
+
+export type FarmSetupFormData = Record<string, string>
+
+export type FarmSetupWarehouseDraft = Pick<
+  WarehouseData,
+  | 'whse_name'
+  | 'fms_type'
+  | 'warehouse_type'
+  | 'full_location_code'
+  | 'addr1'
+  | 'addr2'
+  | 'city'
+  | 'province'
+  | 'address'
+  | 'phone'
+  | 'mobile'
+  | 'remarks'
+  | 'is_active'
+> & {
+  id?: number | null
+  whse_code?: string | null
+  client_key: string
+  father_client_key?: string | null
+  capacity?: number | null
+  is_default_feed?: boolean
+  is_default_receiving?: boolean
+  is_default_disposal?: boolean
+}
+
+export type FarmSetupRecord = {
+  farm: FarmSetupFormData
+  address: FarmSetupFormData
+  warehouses: FarmSetupWarehouseDraft[]
+  assignableWarehouses: FarmSetupWarehouseDraft[]
+  assignedUserIds: number[]
+}
+
+export type FarmSetupPayload = {
+  farm: FarmSetupFormData
+  address: FarmSetupFormData
+  warehouses: FarmSetupWarehouseDraft[]
+  assigned_user_ids: number[]
+  machines: {
+    data: FarmSetupFormData
+  }[]
+}
+
+export async function getFarmAssignableUsers(): Promise<FarmAssignableUser[]> {
+  return listFarmAssignableUsers()
+}
+
+export type FarmSetupApprovalResult = {
+  success?: boolean
+  required?: boolean
+  request_id?: number
+  template_id?: number
+  trigger_id?: number
+  approver_id?: number
+  message?: string
+}
+
+export type FarmSetupResult = {
+  farmId: number | null
+  farmCode: string | null
+  approval: FarmSetupApprovalResult
+}
+
+const FARM_CODE_PREFIX = 'FRM'
+const FARM_CODE_PAD = 6
+const MAX_FARM_CODE_ATTEMPTS = 25
+
+function nextFarmCode(code: string) {
+  const match = code.match(/^FRM(\d+)$/i)
+  const nextNumber = match ? Number(match[1]) + 1 : 1
+  return formatCode(FARM_CODE_PREFIX, nextNumber, FARM_CODE_PAD)
+}
+
+async function insertFarmSetup(payload: FarmSetupPayload): Promise<{
+  farmId: number
+  farmCode: string
+  payload: FarmSetupPayload
+}> {
+  let farmCode = await generateNextCode('v_last_farm_code', FARM_CODE_PREFIX, FARM_CODE_PAD)
+  let lastDuplicateError: unknown = null
+
+  for (let attempt = 0; attempt < MAX_FARM_CODE_ATTEMPTS; attempt += 1) {
+    const payloadWithFarmCode: FarmSetupPayload = {
+      ...payload,
+      farm: {
+        ...payload.farm,
+        code: farmCode,
+      },
+    }
+    const { data, error } = await db.rpc('insert_farm_setup_wizard', {
+      payload: payloadWithFarmCode,
+    })
+
+    if (!error) {
+      return {
+        farmId: Number(data),
+        farmCode,
+        payload: payloadWithFarmCode,
+      }
+    }
+
+    if (!isUniqueConstraintViolation(error, 'farms_code_key')) {
+      console.error('insert_farm_setup_wizard error:', error)
+      throw new Error(error.message)
+    }
+
+    lastDuplicateError = error
+    farmCode = nextFarmCode(farmCode)
+  }
+
+  console.error('insert_farm_setup_wizard exhausted farm code retries:', lastDuplicateError)
+  throw new Error('Unable to assign the next available farm code. Please try again.')
+}
+
+export async function createFarmSetup(payload: FarmSetupPayload): Promise<FarmSetupResult> {
+  const { data: approvalCheckData, error: approvalCheckError } = await db.rpc('check_approval_required', {
+    p_document_type: 'farm_setup_wizard',
+    p_payload: payload,
+  })
+
+  if (approvalCheckError) {
+    console.error('check_approval_required error:', approvalCheckError)
+    throw new Error(approvalCheckError.message)
+  }
+
+  const approvalCheck = (approvalCheckData ?? { required: false }) as FarmSetupApprovalResult
+  const approvalRequired = Boolean(approvalCheck.required)
+  const payloadWithApprovalStatus: FarmSetupPayload = {
+    ...payload,
+    farm: {
+      ...payload.farm,
+      approval_status: approvalRequired ? 'pending' : 'approved',
+    },
+  }
+  const insertedFarm = await insertFarmSetup(payloadWithApprovalStatus)
+  const { farmId, farmCode, payload: persistedPayload } = insertedFarm
+
+  if (!approvalRequired) {
+    return {
+      farmId,
+      farmCode,
+      approval: approvalCheck,
+    }
+  }
+
+  const { data: approvalData, error: approvalError } = await db.rpc('submit_for_approval', {
+    p_document_type: 'farm_setup_wizard',
+    p_document_id: farmId,
+    p_document_no: farmCode,
+    p_payload: persistedPayload,
+    p_remarks: 'Farm setup submitted for approval.',
+  })
+
+  if (approvalError) {
+    console.error('submit_for_approval error:', approvalError)
+    throw new Error(approvalError.message)
+  }
+
+  const approval = (approvalData ?? { required: false }) as FarmSetupApprovalResult
+
+  if (approval.required) {
+    if (approval.request_id) {
+      const { error: updateError } = await db
+        .from('farms')
+        .update({ approval_request_id: approval.request_id })
+        .eq('id', farmId)
+
+      if (updateError) throw new Error(updateError.message)
+    }
+
+    return {
+      farmId,
+      farmCode,
+      approval,
+    }
+  }
+
+  const { error: approveFallbackError } = await db
+    .from('farms')
+    .update({ approval_status: 'approved' })
+    .eq('id', farmId)
+
+  if (approveFallbackError) throw new Error(approveFallbackError.message)
+
+  return {
+    farmId,
+    farmCode,
+    approval,
+  }
+}
+
+const toFarmSetupWarehouseDraft = (warehouse: WarehouseData): FarmSetupWarehouseDraft => ({
+  id: warehouse.id,
+  client_key: `warehouse-${warehouse.id}`,
+  father_client_key: warehouse.father_id ? `warehouse-${warehouse.father_id}` : null,
+  whse_name: warehouse.whse_name,
+  whse_code: warehouse.whse_code,
+  fms_type: warehouse.fms_type,
+  warehouse_type: warehouse.warehouse_type,
+  capacity: warehouse.capacity,
+  full_location_code: warehouse.full_location_code,
+  addr1: warehouse.addr1,
+  addr2: warehouse.addr2,
+  city: warehouse.city,
+  province: warehouse.province,
+  address: warehouse.address,
+  phone: warehouse.phone,
+  mobile: warehouse.mobile,
+  remarks: warehouse.remarks,
+  is_active: warehouse.is_active,
+  is_default_feed: warehouse.is_default_feed_warehouse ?? false,
+  is_default_receiving: warehouse.is_default_receiving_warehouse ?? false,
+  is_default_disposal: warehouse.is_default_disposal_warehouse ?? false,
+})
+
+export async function getFarmSetup(farmId: number): Promise<FarmSetupRecord> {
+  const [{ data: farmData, error: farmError }, warehouseResult] = await Promise.all([
+    db.rpc('get_farm_full', { p_farm_id: farmId }),
+    getWarehouses(),
+  ])
+
+  if (farmError) throw new Error(farmError.message)
+  if (!warehouseResult.success || !Array.isArray(warehouseResult.data)) {
+    throw new Error(warehouseResult.error ?? 'Unable to load warehouses.')
+  }
+  if (!farmData?.farm) throw new Error('Farm not found.')
+
+  const assignedUsers = await listFarmAssignedUsers(
+    [{ id: farmId, code: String(farmData.farm.code ?? '').trim() }],
+    [2, 3],
+    { activeUsersOnly: true },
+  )
+
+  const { assigned: assignedWarehouseRows, assignable: assignableWarehouseRows } =
+    resolveFarmWarehouseAssociations(
+      farmId,
+      warehouseResult.data,
+      farmData.associated_warehouses ?? farmData.farm.associated_warehouses,
+    )
+
+  return {
+    farm: farmData.farm,
+    address: normalizeFarmSetupAddress(farmData),
+    warehouses: assignedWarehouseRows.map(toFarmSetupWarehouseDraft),
+    assignableWarehouses: assignableWarehouseRows.map(toFarmSetupWarehouseDraft),
+    assignedUserIds: (assignedUsers.get(farmId) ?? []).map(user => user.id),
+  }
+}
+
+export async function updateFarmSetup(farmId: number, payload: FarmSetupPayload): Promise<void> {
+  const { error } = await db.rpc('update_farm_setup_wizard', {
+    p_farm_id: farmId,
+    payload,
+  })
+
+  if (error) {
+    console.error('update_farm_setup_wizard error:', error)
+    throw new Error(error.message)
+  }
+}
+
+export function formatCode(prefix: string, number: number, pad: number = 6) {
+  return `${prefix}${number.toString().padStart(pad, '0')}`
+}
+
+export async function getLastCode(viewName: string): Promise<number> {
+  const { data, error } = await db.from(viewName).select('last_number').single()
+
+  if (error) throw error
+
+  return data?.last_number ?? 0
+}
+
+export async function generateNextCode(viewName: string, prefix: string, pad: number = 6) {
+  const last = await getLastCode(viewName)
+  return formatCode(prefix, last + 1, pad)
+}

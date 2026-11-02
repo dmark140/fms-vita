@@ -1,0 +1,36 @@
+export const runtime = "nodejs"
+
+import { after, NextResponse } from "next/server"
+import { requireAdminActor, adminAccessError } from "@/lib/auth/adminAccess"
+import { RegistrationError } from "@/lib/data/repositories/registration.server"
+import { listPendingActivations, decideRegistration } from "@/lib/data/repositories/userActivation.server"
+import { processTransactionalEmails } from "@/lib/email/processTransactionalEmails.server"
+
+function failure(error: unknown) {
+  const result = error instanceof RegistrationError ? { status: error.status, message: error.message } : adminAccessError(error)
+  return NextResponse.json({ error: result.message }, { status: result.status })
+}
+
+export async function GET(request: Request) {
+  try {
+    const actor = await requireAdminActor(request)
+    return NextResponse.json({ users: await listPendingActivations(actor) }, { headers: { "Cache-Control": "no-store" } })
+  } catch (error) { return failure(error) }
+}
+
+export async function POST(request: Request) {
+  try {
+    const actor = await requireAdminActor(request)
+    const input = await request.json()
+    if (!input || typeof input !== "object" || Array.isArray(input)) throw new RegistrationError("Invalid decision.")
+    const user = await decideRegistration(actor, input)
+    after(async () => {
+      try {
+        await processTransactionalEmails(20)
+      } catch (error) {
+        console.error("Account email processing failed:", error)
+      }
+    })
+    return NextResponse.json({ user })
+  } catch (error) { return failure(error) }
+}

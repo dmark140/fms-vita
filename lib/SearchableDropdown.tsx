@@ -47,6 +47,7 @@ export default function SearchableDropdown<
 }: Props<T>) {
   const [open, setOpen] = useState(false)
   const [search, setSearch] = useState('')
+  const [highlightedIndex, setHighlightedIndex] = useState(0)
 
   // resolve list
   const resolvedList = useMemo<T[]>(() => {
@@ -87,6 +88,11 @@ export default function SearchableDropdown<
     })
   }, [resolvedList, search, codeLabel, nameLabel])
 
+  const safeHighlightedIndex = Math.min(
+    highlightedIndex,
+    Math.max(0, filtered.length - 1),
+  )
+
   const selectItem = (item: T) => {
     onChange(String(item[codeLabel]), item)
     setOpen(false)
@@ -107,9 +113,23 @@ export default function SearchableDropdown<
   }
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Tab') {
+    if (e.key === 'ArrowDown' && filtered.length > 0) {
+      e.preventDefault()
+      setHighlightedIndex(current => (current + 1) % filtered.length)
+      return
+    }
+
+    if (e.key === 'ArrowUp' && filtered.length > 0) {
+      e.preventDefault()
+      setHighlightedIndex(current => (current - 1 + filtered.length) % filtered.length)
+      return
+    }
+
+    if (e.key === 'Enter' || e.key === 'Tab') {
+      e.preventDefault()
+
       if (filtered.length > 0) {
-        selectItem(filtered[0])
+        selectItem(filtered[safeHighlightedIndex] ?? filtered[0])
       } else if (allowFreeText && search) {
         selectFreeText()
       }
@@ -119,14 +139,26 @@ export default function SearchableDropdown<
   return (
     <Popover
       open={open}
-      onOpenChange={(o) => !disabled && setOpen(o)}
+      onOpenChange={(o) => {
+        if (disabled) return
+        setOpen(o)
+        setHighlightedIndex(0)
+      }}
     >
       <PopoverTrigger asChild>
         <Button
+          data-slot="searchable-dropdown-trigger"
           type="button"
           disabled={disabled}
           title={displayText}
-          className=" bg-input border text-foreground hover:bg-input/50 h-9 w-full justify-start overflow-hidden whitespace-nowrap  disabled:opacity-50 disabled:cursor-not-allowed"
+          className="h-9 w-full justify-start overflow-hidden whitespace-nowrap border border-input bg-white text-foreground hover:bg-accent disabled:cursor-not-allowed disabled:bg-gray-100 disabled:text-muted-foreground disabled:opacity-100 dark:bg-input/30 dark:hover:bg-input/50 dark:disabled:bg-input/20"
+          onKeyDown={(event) => {
+            if ((event.key === 'ArrowDown' || event.key === 'ArrowUp') && !open) {
+              event.preventDefault()
+              setOpen(true)
+              setHighlightedIndex(0)
+            }
+          }}
         >
           <span className="truncate flex items-center gap-2">
             {!displayText ? (
@@ -149,7 +181,10 @@ export default function SearchableDropdown<
           <CommandInput
             placeholder="Search..."
             value={search}
-            onValueChange={setSearch}
+            onValueChange={(value) => {
+              setSearch(value)
+              setHighlightedIndex(0)
+            }}
           />
 
           <CommandEmpty>
@@ -167,7 +202,10 @@ export default function SearchableDropdown<
               <CommandItem
                 key={idx}
                 onSelect={() => selectItem(item)}
-                className="w-full whitespace-nowrap px-4"
+                onMouseMove={() => setHighlightedIndex(idx)}
+                className={`w-full whitespace-nowrap px-4 ${
+                  idx === safeHighlightedIndex ? 'bg-accent text-accent-foreground' : ''
+                }`}
               >
                 {nameLabel
                   ? showNameOnly

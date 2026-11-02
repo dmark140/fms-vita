@@ -1,4 +1,7 @@
+"use client";
+
 import Link from "next/link";
+import { useEffect } from "react";
 
 interface BreadcrumbProps {
   CurrentPageName: string;
@@ -8,6 +11,22 @@ interface BreadcrumbProps {
   SecondPreviewPageLink?: string;
 }
 
+const getBrowserTitle = (
+  currentPageName: string,
+  parentPageName?: string,
+) => {
+  const actionMatch = currentPageName.trim().match(/^(new|create|edit|view|post|print)\b/i);
+
+  if (actionMatch && parentPageName) {
+    const action = /^create new\b/i.test(currentPageName.trim())
+      ? "new"
+      : actionMatch[1].toLowerCase();
+    return `${parentPageName} / ${action.charAt(0).toUpperCase()}${action.slice(1)}`;
+  }
+
+  return currentPageName;
+};
+
 const Breadcrumb = ({
   CurrentPageName,
   FirstPreviewsPageName,
@@ -15,49 +34,48 @@ const Breadcrumb = ({
   SecondPreviewPageName,
   SecondPreviewPageLink,
 }: BreadcrumbProps) => {
+  useEffect(() => {
+    document.title = getBrowserTitle(CurrentPageName, FirstPreviewsPageName);
+  }, [CurrentPageName, FirstPreviewsPageName]);
+
   return (
-    <nav aria-label="Breadcrumb" className="flex flex-col">
-      
-      {/* Page Title - Always Visible */}
-      <h1 className="text-2xl font-semibold pb-1">
+    <nav aria-label="Breadcrumb" className="flex min-w-0 flex-col-reverse gap-0.5">
+      <h1 className="truncate text-xl font-semibold leading-6 tracking-tight text-foreground">
         {CurrentPageName}
       </h1>
 
-      {/* Breadcrumb Links - Hidden on md and smaller */}
-      <ol className="hidden md:flex items-center gap-2 text-sm whitespace-nowrap">
-        
+      <ol className="flex min-w-0 items-center gap-1.5 overflow-hidden whitespace-nowrap text-[11px] leading-4 text-muted-foreground">
         {SecondPreviewPageName && (
           <>
-            <li>
+            <li className="min-w-0 truncate">
               <Link
                 href={SecondPreviewPageLink || "#"}
-                className="transition-colors hover:underline"
+                className="transition-colors hover:text-primary"
               >
                 {SecondPreviewPageName}
               </Link>
             </li>
-            <span>/</span>
+            <li aria-hidden="true">/</li>
           </>
         )}
 
         {FirstPreviewsPageName && (
           <>
-            <li>
+            <li className="min-w-0 truncate">
               <Link
                 href={FirstPreviewsPageLink || "#"}
-                className="transition-colors hover:underline"
+                className="transition-colors hover:text-primary"
               >
                 {FirstPreviewsPageName}
               </Link>
             </li>
-            <span>/</span>
+            <li aria-hidden="true">/</li>
           </>
         )}
 
-        <li className="font-semibold" aria-current="page">
+        <li className="min-w-0 truncate font-medium text-foreground" aria-current="page">
           {CurrentPageName}
         </li>
-
       </ol>
     </nav>
   );

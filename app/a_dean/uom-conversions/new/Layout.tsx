@@ -1,6 +1,6 @@
 'use client'
 
-import { FormEvent, useEffect, useMemo, useState } from 'react'
+import { FormEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import { Plus, Save, Trash2 } from 'lucide-react'
 import { toast } from 'sonner'
@@ -29,6 +29,7 @@ const newRow = (key: number): ConversionFormRow => ({
 })
 
 export default function NewUomConversionLayout() {
+  const requestId = useRef<string | null>(null)
   const router = useRouter()
   const params = useParams<{ id?: string }>()
   const groupId = params.id ? Number(params.id) : null
@@ -37,7 +38,7 @@ export default function NewUomConversionLayout() {
   const [loadingUoms, setLoadingUoms] = useState(true)
   const [saving, setSaving] = useState(false)
   const [nextKey, setNextKey] = useState(2)
-  const [form, setForm] = useState({ code: '', name: '', base_uom_id: '', remarks: '' })
+  const [form, setForm] = useState({ code: '', name: '', base_uom_id: '', default_uom_id: '', remarks: '' })
   const [rows, setRows] = useState<ConversionFormRow[]>([newRow(1)])
 
   useEffect(() => {
@@ -50,6 +51,7 @@ export default function NewUomConversionLayout() {
       const data = await getUomGroupById(groupId) as {
         code: string
         name: string
+        default_uom_id: number | null
         base_uom_id: number
         remarks: string | null
         conversions: Array<{
@@ -69,6 +71,7 @@ export default function NewUomConversionLayout() {
         code: data.code,
         name: data.name,
         base_uom_id: String(data.base_uom_id),
+        default_uom_id: String(data.default_uom_id ?? data.base_uom_id),
         remarks: data.remarks || '',
       })
       setRows(
@@ -95,6 +98,12 @@ export default function NewUomConversionLayout() {
     [form.base_uom_id, uoms]
   )
 
+  const defaultUomOptions = uoms.filter(uom =>
+    String(uom.id) === form.base_uom_id || rows.some(row => row.uom_id === String(uom.id))
+  )
+  const defaultUomId = defaultUomOptions.some(uom => String(uom.id) === form.default_uom_id)
+    ? form.default_uom_id : form.base_uom_id
+
   const availableUoms = (currentRow: ConversionFormRow) => {
     const selectedElsewhere = new Set(
       rows.filter(row => row.key !== currentRow.key).map(row => row.uom_id).filter(Boolean)
@@ -118,11 +127,14 @@ export default function NewUomConversionLayout() {
       toast('Please fill in the group code, name, and base UoM.')
       return
     }
-    if (rows.some(row => !row.uom_id || !row.base_qty || Number(row.base_qty) <= 0)) {
+
+    const filledRows = rows.filter(row => row.uom_id || row.base_qty)
+    if (filledRows.some(row => !row.uom_id || !row.base_qty || Number(row.base_qty) <= 0)) {
       toast('Every conversion row needs a UoM and a base quantity greater than zero.')
       return
     }
-    const selectedIds = rows.map(row => row.uom_id)
+
+    const selectedIds = filledRows.map(row => row.uom_id)
     if (new Set(selectedIds).size !== selectedIds.length) {
       toast('A UoM can only appear once in a conversion group.')
       return
@@ -130,14 +142,17 @@ export default function NewUomConversionLayout() {
 
     setSaving(true)
     try {
+      requestId.current ??= crypto.randomUUID()
       const payload = {
+        request_id: requestId.current,
         code: form.code,
         name: form.name,
         base_uom_id: Number(form.base_uom_id),
+        default_uom_id: Number(defaultUomId),
         remarks: form.remarks,
         conversions: [
           { uom_id: Number(form.base_uom_id), base_qty: 1, remarks: 'Base Unit' },
-          ...rows.map(row => ({
+          ...filledRows.map(row => ({
             uom_id: Number(row.uom_id),
             base_qty: Number(row.base_qty),
             remarks: row.remarks,
@@ -175,13 +190,12 @@ export default function NewUomConversionLayout() {
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmit} className="space-y-6">
-            <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
               <div className="space-y-2">
                 <Label required>Group Code</Label>
                 <Input
                   value={form.code}
                   onChange={event => setForm(prev => ({ ...prev, code: event.target.value.toUpperCase() }))}
-                  placeholder="MEDICINE"
                   required
                 />
               </div>
@@ -190,7 +204,6 @@ export default function NewUomConversionLayout() {
                 <Input
                   value={form.name}
                   onChange={event => setForm(prev => ({ ...prev, name: event.target.value }))}
-                  placeholder="Medicine"
                   required
                 />
               </div>
@@ -205,7 +218,7 @@ export default function NewUomConversionLayout() {
                   disabled={loadingUoms}
                 >
                   <SelectTrigger className="w-full">
-                    <SelectValue placeholder={loadingUoms ? 'Loading UoMs...' : 'Select base UoM'} />
+                    <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
                     {uoms.map(uom => (
@@ -215,6 +228,20 @@ export default function NewUomConversionLayout() {
                     ))}
                   </SelectContent>
                 </Select>
+              </div>
+              <div className="space-y-2">
+                <Label required>Default UoM</Label>
+                <Select value={defaultUomId}
+                  onValueChange={value => setForm(prev => ({ ...prev, default_uom_id: value }))}
+                  disabled={loadingUoms || !form.base_uom_id}>
+                  <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {defaultUomOptions.map(uom => (
+                      <SelectItem key={uom.id} value={String(uom.id)}>{uom.code} - {uom.name}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-stone-500">Preselected when this group is used. Base UoM still controls conversion quantities.</p>
               </div>
             </div>
 
@@ -231,7 +258,7 @@ export default function NewUomConversionLayout() {
                 <div>
                   <h3 className="font-semibold">Conversion Rows</h3>
                   <p className="text-sm text-stone-500">
-                    Enter how many {baseUom?.code || 'base units'} are in one selected UoM.
+                    Optional. Add rows only when another UoM converts to {baseUom?.code || 'the base UoM'}.
                   </p>
                 </div>
                 <Button
@@ -284,7 +311,7 @@ export default function NewUomConversionLayout() {
                               onValueChange={value => updateRow(row.key, 'uom_id', value)}
                               disabled={!form.base_uom_id}
                             >
-                              <SelectTrigger className="w-full"><SelectValue placeholder="Select UoM" /></SelectTrigger>
+                              <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
                               <SelectContent>
                                 {availableUoms(row).map(uom => (
                                   <SelectItem key={uom.id} value={String(uom.id)}>
@@ -301,7 +328,6 @@ export default function NewUomConversionLayout() {
                               step="0.000001"
                               value={row.base_qty}
                               onChange={event => updateRow(row.key, 'base_qty', event.target.value)}
-                              placeholder="10"
                             />
                           </td>
                           <td className="min-w-56 px-3 py-3">{meaning}</td>
@@ -309,7 +335,6 @@ export default function NewUomConversionLayout() {
                             <Input
                               value={row.remarks}
                               onChange={event => updateRow(row.key, 'remarks', event.target.value)}
-                              placeholder="Optional"
                             />
                           </td>
                           <td className="px-3 py-3 text-right">

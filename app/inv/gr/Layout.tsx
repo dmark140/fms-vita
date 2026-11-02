@@ -2,187 +2,257 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
+import { toast } from 'sonner'
+import { addDays, format } from 'date-fns'
 import {
-  ArrowDownUp,
-  ClipboardClock,
+  Copy,
   Eye,
-  FileX2,
-  ListFilter,
+  MoreHorizontal,
+  Plus,
   RefreshCw,
-  Search,
 } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import {
-  GoodsReceipt,
-  getGoodsReceipts,
-  getReceiptItemSummary,
-} from './api'
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import DynamicTable, { Column } from '@/components/ui/DataTableV2'
+import { PageHeader, PageHeaderActions, PageShell } from '@/components/ui/page-layout'
+import DefaultFarmComboBox from '@/app/components/DefaultFarmComboBox'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import Breadcrumb from '@/lib/Breadcrumb'
+import { useSidebar } from '@/lib/sidebar/SidebarProvider'
+import { getInventoryStatusBadgeClass } from '@/app/inv/statusStyles'
+import type { GoodsReceipt } from './api'
+import { getGoodsReceipts, getReceiptItemSummary } from './listApi'
+
+type GoodsReceiptTableRow = Record<string, unknown> & {
+  id: number | null
+  grNo: string
+  itemDescription: string
+  vendor: string
+  farmName: string
+  receiveDate: string
+  createdDate: string
+  returnedQty: number
+  balanceQty: number
+  status: string
+  receipt: GoodsReceipt
+}
 
 export default function GoodsReceiveHistory() {
   const router = useRouter()
+  const { setCollapsed } = useSidebar()
   const [receipts, setReceipts] = useState<GoodsReceipt[]>([])
-  const [search, setSearch] = useState('')
-  const [pageSize, setPageSize] = useState('10')
+  const [loading, setLoading] = useState(true)
+  const [farmId, setFarmId] = useState<string | number>('')
+  const [dateFrom, setDateFrom] = useState(() => format(addDays(new Date(), -30), 'yyyy-MM-dd'))
+  const [dateTo, setDateTo] = useState(() => format(new Date(), 'yyyy-MM-dd'))
 
-  const refresh = useCallback(() => {
-    setReceipts(getGoodsReceipts())
-  }, [])
+  const refresh = useCallback(async () => {
+    setLoading(true)
+    try {
+      setReceipts(await getGoodsReceipts({
+        limit: 100,
+        farmId: farmId || undefined,
+        dateFrom: dateFrom || undefined,
+        dateTo: dateTo || undefined,
+      }))
+    } catch (error) {
+      toast.error(error && typeof error === 'object' && 'message' in error && typeof error.message === 'string'
+        ? error.message : 'Unable to load Goods Receipt records. Please try again.')
+    } finally {
+      setLoading(false)
+    }
+  }, [dateFrom, dateTo, farmId])
 
   useEffect(() => {
     router.prefetch('/inv/gr/new')
-    const timer = window.setTimeout(refresh, 0)
+    const timer = window.setTimeout(() => {
+      refresh()
+    }, 0)
     return () => window.clearTimeout(timer)
   }, [refresh, router])
 
-  const filteredReceipts = useMemo(() => {
-    const term = search.trim().toLowerCase()
-    if (!term) return receipts
+  const rows = useMemo<GoodsReceiptTableRow[]>(
+    () =>
+      receipts.map(receipt => {
+        const receivedQty = receipt.lines.reduce((sum, line) => sum + Number(line.baseQty || 0), 0)
+        const returnedQty = receipt.lines.reduce((sum, line) => sum + Number(line.returnedQty || 0), 0)
 
-    return receipts.filter(receipt =>
-      [
-        receipt.grNo,
-        receipt.vendor,
-        receipt.farmName,
-        receipt.status,
-        getReceiptItemSummary(receipt),
-      ].some(value => value.toLowerCase().includes(term)),
-    )
-  }, [receipts, search])
+        return {
+          id: receipt.id,
+          grNo: receipt.grNo,
+          itemDescription: getReceiptItemSummary(receipt),
+          vendor: receipt.vendor || '-',
+          farmName: receipt.farmName || '-',
+          receiveDate: receipt.receiveDate,
+          createdDate: receipt.createdAt ? format(new Date(receipt.createdAt), 'yyyy-MM-dd') : '-',
+          returnedQty,
+          balanceQty: receivedQty - returnedQty,
+          status: receipt.status,
+          receipt,
+        }
+      }),
+    [receipts],
+  )
+
+  const columns = useMemo<Column<GoodsReceiptTableRow>[]>(
+    () => [
+      {
+        key: 'grNo', label: 'GR No.', render: row => (
+          <>
+            <span className='bg-sidebar-accent p-1 px-2 font-semibold rounded-md'>{row.grNo}</span>
+          </>
+        )
+
+      },
+      { key: 'itemDescription', label: 'Item Description' },
+      { key: 'vendor', label: 'Vendor' },
+      { key: 'farmName', label: 'Farm' },
+      { key: 'receiveDate', label: 'Date Received' },
+      { key: 'createdDate', label: 'Created Date' },
+      // { key: 'returnedQty', label: 'Returned Qty', align: 'right' },
+      { key: 'balanceQty', label: 'Balance Qty', align: 'center' },
+      {
+        key: 'status',
+        label: 'Status',
+        render: row => (
+          <span className={getInventoryStatusBadgeClass(row.status)}>
+            {row.status}
+          </span>
+        ),
+        align: "center"
+      },
+      {
+        key: 'action',
+        label: 'Action',
+        type: 'button',
+        sortable: false,
+        searchable: false,
+        render: row => (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                type="button"
+                size="icon"
+                variant="outline"
+                disabled={row.id === null}
+                aria-label={`Open actions for ${row.grNo}`}
+                onClick={event => event.stopPropagation()}
+              >
+                <MoreHorizontal className="size-4" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-40" onClick={event => event.stopPropagation()}>
+              <DropdownMenuItem
+                onClick={event => {
+                  event.stopPropagation()
+                  if (row.id === null) return
+                  router.push(`/inv/gr/post?id=${row.id}`)
+                }}
+              >
+                <Eye className="size-4" />
+                View
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onClick={event => {
+                  event.stopPropagation()
+                  if (row.id === null) return
+                  router.push(`/inv/gr/new?duplicateId=${row.id}`)
+                }}
+              >
+                <Copy className="size-4" />
+                Duplicate
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        ),
+      },
+    ],
+    [router],
+  )
+
+  const openNewGoodsReceipt = () => {
+    setCollapsed(true)
+    router.push('/inv/gr/new')
+  }
 
   return (
-    <main className="min-h-[calc(100vh-4rem)] bg-stone-50/40 pb-8 text-stone-950">
-      <header className="border-b bg-white px-4 py-4">
-        <h1 className="text-xl font-semibold tracking-tight">Goods Receive</h1>
-        <p className="mt-1 text-sm text-stone-500">Manage your goods receive direct.</p>
-      </header>
+    <PageShell>
+      <PageHeader>
+        <Breadcrumb
+          FirstPreviewsPageName="Inventory"
+          CurrentPageName="Feed Stock In"
+        />
 
-      <div className="px-3 pt-4">
-        <div className="inline-flex rounded-full border bg-white p-1 shadow-sm">
-          <button
-            type="button"
-            onClick={() => router.push('/inv/gr/new')}
-            className="inline-flex h-8 items-center gap-2 rounded-full px-4 text-sm font-medium hover:bg-stone-100"
-          >
-            <ArrowDownUp className="size-4" />
-            New GR
-          </button>
-          <button
-            type="button"
-            className="inline-flex h-8 items-center gap-2 rounded-full bg-stone-950 px-4 text-sm font-semibold text-white shadow-sm"
-          >
-            <ClipboardClock className="size-4" />
-            Receive History
-          </button>
+        <PageHeaderActions>
+            <Button variant="outline" size="sm" onClick={refresh} disabled={loading}>
+              <RefreshCw className={`size-4 ${loading ? 'animate-spin' : ''}`} />
+              {loading ? 'Loading...' : 'Refresh'}
+            </Button>
+          <Button type="button" size="sm" onClick={openNewGoodsReceipt}>
+            <Plus className="size-4" />
+            Add Feeds Inventory
+          </Button>
+        </PageHeaderActions>
+      </PageHeader>
+
+      <div className="space-y-3">
+        <div className="grid gap-2 rounded-md border bg-muted/30 p-3 md:grid-cols-[minmax(220px,320px)_180px_180px]">
+          <DefaultFarmComboBox
+            label="Farm"
+            value={farmId}
+            valueKey="id"
+            setValue={setFarmId}
+          />
+
+          <div className="space-y-2">
+            <Label htmlFor="gr-date-from">Created Date From</Label>
+            <Input
+              id="gr-date-from"
+              type="date"
+              value={dateFrom}
+              max={dateTo || undefined}
+              onChange={event => setDateFrom(event.target.value)}
+            />
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="gr-date-to">Created Date To</Label>
+            <Input
+              id="gr-date-to"
+              type="date"
+              value={dateTo}
+              min={dateFrom || undefined}
+              onChange={event => setDateTo(event.target.value)}
+            />
+          </div>
         </div>
+
+        <DynamicTable
+          actionsFirst
+          loading={loading}
+          initialFilters={[]}
+          title="Feed Stock In"
+          description={`${rows.length} goods receipt(s)`}
+          columns={columns}
+          data={rows}
+          rowKey={row => row.id ?? row.grNo}
+          searchPlaceholder="Search goods receipts..."
+          emptyMessage="No goods receipts found"
+          noResultsMessage="No matching goods receipts found"
+          onRowClick={row => {
+            if (row.id !== null) router.push(`/inv/gr/post?id=${row.id}`)
+          }}
+        />
       </div>
-
-      <section className="m-3 mt-6 rounded-xl border bg-white p-5 shadow-sm">
-        <h2 className="text-base font-semibold">Goods Receive History</h2>
-
-        <div className="mt-4 overflow-hidden rounded-xl border shadow-sm">
-          <div className="flex flex-col gap-3 border-b bg-white p-4 md:flex-row md:items-center">
-            <label className="flex h-9 w-full items-center gap-2 rounded-lg border px-3 md:w-56">
-              <Search className="size-4 text-stone-400" />
-              <input
-                value={search}
-                onChange={event => setSearch(event.target.value)}
-                placeholder="Search..."
-                className="min-w-0 flex-1 bg-transparent text-sm outline-none"
-              />
-            </label>
-
-            <Button variant="outline" className="gap-2">
-              <ListFilter className="size-4" />
-              Filter
-            </Button>
-
-            <select
-              value={pageSize}
-              onChange={event => setPageSize(event.target.value)}
-              className="h-9 rounded-lg border bg-white px-3 text-sm outline-none"
-              aria-label="Rows per page"
-            >
-              <option value="10">10</option>
-              <option value="25">25</option>
-              <option value="50">50</option>
-            </select>
-
-            <Button variant="outline" className="gap-2 md:ml-auto" onClick={refresh}>
-              <RefreshCw className="size-4" />
-              Refresh
-            </Button>
-          </div>
-
-          <div className="overflow-x-auto">
-            <table className="min-w-[1100px] w-full text-sm">
-              <thead className="border-b bg-stone-50 text-left text-xs font-semibold text-stone-700">
-                <tr>
-                  {[
-                    'GR No.',
-                    'Item Description',
-                    'Vendor',
-                    'Farm',
-                    'Date Received',
-                    'Returned Qty',
-                    'Balance Qty',
-                    'Status',
-                    'Action',
-                  ].map(label => (
-                    <th key={label} className="whitespace-nowrap px-4 py-3">
-                      <span className="inline-flex items-center gap-1">
-                        {label}
-                        {label !== 'Action' && <ArrowDownUp className="size-3 text-stone-300" />}
-                      </span>
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody className="divide-y">
-                {filteredReceipts.slice(0, Number(pageSize)).map(receipt => {
-                  const receivedQty = receipt.lines.reduce((sum, line) => sum + Number(line.baseQty || 0), 0)
-                  const returnedQty = receipt.lines.reduce((sum, line) => sum + Number(line.returnedQty || 0), 0)
-
-                  return (
-                    <tr key={receipt.id} className="hover:bg-stone-50">
-                      <td className="whitespace-nowrap px-4 py-3 font-medium">{receipt.grNo}</td>
-                      <td className="max-w-64 truncate px-4 py-3">{getReceiptItemSummary(receipt)}</td>
-                      <td className="px-4 py-3">{receipt.vendor || '-'}</td>
-                      <td className="px-4 py-3">{receipt.farmName || '-'}</td>
-                      <td className="whitespace-nowrap px-4 py-3">{receipt.receiveDate}</td>
-                      <td className="px-4 py-3 text-right">{returnedQty}</td>
-                      <td className="px-4 py-3 text-right">{receivedQty - returnedQty}</td>
-                      <td className="px-4 py-3">
-                        <span className="rounded-full bg-slate-700 px-2.5 py-1 text-xs font-semibold text-white">
-                          {receipt.status}
-                        </span>
-                      </td>
-                      <td className="px-4 py-3">
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          onClick={() => router.push(`/inv/gr/new?id=${receipt.id}`)}
-                        >
-                          <Eye className="size-4" />
-                          View
-                        </Button>
-                      </td>
-                    </tr>
-                  )
-                })}
-              </tbody>
-            </table>
-          </div>
-
-          {filteredReceipts.length === 0 && (
-            <div className="flex min-h-40 flex-col items-center justify-center gap-3 text-stone-400">
-              <FileX2 className="size-10 text-stone-300" />
-              <p className="text-sm">No direct receive records found.</p>
-            </div>
-          )}
-        </div>
-      </section>
-    </main>
+    </PageShell>
   )
 }

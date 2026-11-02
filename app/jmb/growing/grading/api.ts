@@ -1,7 +1,13 @@
 import { db } from "@/lib/Supabase/supabaseClient";
+import { breederAgeAnchorDate } from "@/lib/utils/breederPlacement";
+import { compareNaturalText } from "@/lib/utils/naturalSort";
 
 const GRADING_TABLE = "tbl_grading";
 const PLACEMENT_TABLE = "tbl_placement";
+
+function throwSupabaseError(error: { message?: string } | null) {
+  if (error) throw new Error(error.message ?? "Supabase request failed.");
+}
 
 export type Grading = {
   id: number;
@@ -30,13 +36,30 @@ export type GradingUpdate = Partial<GradingInsert>;
 export type GradingPlacement = {
   id: number;
   placement_date: string;
+  age_anchor_date?: string | null;
   dr_no: string | null;
   farm_id?: number | null;
+  farm_code?: string | null;
   farm_name: string | null;
   building_no: string | null;
   pen_no: string | null;
   f_endingbalance?: number | null;
   m_endingbalance?: number | null;
+};
+
+export type GradingFarmHistory = {
+  id: number;
+  record_date: string | null;
+  farm: string | null;
+  building: string | null;
+  pen: string | null;
+  age: number | null;
+  week_no: string | null;
+  female_qty_old: number | null;
+  female_qty_new: number | null;
+  male_qty_old: number | null;
+  male_qty_new: number | null;
+  remarks: string | null;
 };
 
 export async function getGradingById(id: number) {
@@ -46,7 +69,7 @@ export async function getGradingById(id: number) {
     .eq("id", id)
     .single();
 
-  if (error) throw error;
+  throwSupabaseError(error);
   const row = data as Grading;
 
   if (!row.placement_id) return row;
@@ -67,7 +90,7 @@ export async function createGrading(payload: GradingInsert) {
     .select("*")
     .single();
 
-  if (error) throw error;
+  throwSupabaseError(error);
   return data as Grading;
 }
 
@@ -77,7 +100,7 @@ export async function createGradingBatch(payloads: GradingInsert[]) {
     .insert(payloads)
     .select("*");
 
-  if (error) throw error;
+  throwSupabaseError(error);
   return (data ?? []) as Grading[];
 }
 
@@ -92,7 +115,7 @@ export async function updateGrading(id: number, payload: GradingUpdate) {
     .select("*")
     .single();
 
-  if (error) throw error;
+  throwSupabaseError(error);
   return data as Grading;
 }
 
@@ -100,29 +123,123 @@ export async function listGradingPlacements() {
   const { data, error } = await db
     .from(PLACEMENT_TABLE)
     .select(
-      "id, placement_date, dr_no, farm_id, farm_name, building_no, pen_no, f_endingbalance, m_endingbalance",
+      "id, placement_date, age_anchor_date, dr_no, farm_id, farm_code, farm_name, building_no, pen_no, f_endingbalance, m_endingbalance",
     )
     .not("farm_name", "is", null)
     .not("building_no", "is", null)
-    .order("farm_name", { ascending: true })
-    .order("building_no", { ascending: true })
-    .order("pen_no", { ascending: true })
     .order("placement_date", { ascending: false })
     .order("id", { ascending: false });
 
-  if (error) throw error;
-  return (data ?? []) as GradingPlacement[];
+  throwSupabaseError(error);
+  return ((data ?? []) as GradingPlacement[]).sort(
+    (left, right) =>
+      compareNaturalText(left.farm_name, right.farm_name) ||
+      compareNaturalText(left.building_no, right.building_no) ||
+      compareNaturalText(left.pen_no, right.pen_no) ||
+      right.placement_date.localeCompare(left.placement_date) ||
+      right.id - left.id,
+  );
+}
+
+export async function listGradingHistoryByFarm(params: {
+  farmId?: number | null;
+  farmName?: string | null;
+  buildingNo?: string | null;
+}) {
+  let placementQuery = db
+    .from(PLACEMENT_TABLE)
+    .select(
+      "id, placement_date, age_anchor_date, dr_no, farm_id, farm_name, building_no, pen_no, f_endingbalance, m_endingbalance",
+    );
+
+  if (params.farmId != null) {
+    placementQuery = placementQuery.eq("farm_id", params.farmId);
+  } else if (params.farmName?.trim()) {
+    placementQuery = placementQuery.eq("farm_name", params.farmName.trim());
+  }
+
+  if (params.buildingNo?.trim()) {
+    placementQuery = placementQuery.eq("building_no", params.buildingNo.trim());
+  }
+
+  const { data: placements, error: placementError } = await placementQuery;
+  throwSupabaseError(placementError);
+
+  const placementRows = (placements ?? []) as GradingPlacement[];
+  const placementIds = placementRows.map((placement) => placement.id);
+  if (!placementIds.length) return [];
+
+  const { data, error } = await db
+    .from(GRADING_TABLE)
+    .select(
+      "id, placement_id, daterec, female_qty_old, female_qty_new, male_qty_old, male_qty_new, remarks",
+    )
+    .eq("isactive", true)
+    .in("placement_id", placementIds)
+    .order("daterec", { ascending: false })
+    .order("id", { ascending: false })
+    .limit(50);
+
+  throwSupabaseError(error);
+
+  const placementById = new Map(
+    placementRows.map((placement) => [placement.id, placement]),
+  );
+
+  return ((data ?? []) as Grading[]).map((row) => {
+    const placement = row.placement_id
+      ? placementById.get(row.placement_id)
+      : undefined;
+    const age = getAgeInDays(
+      breederAgeAnchorDate(placement ?? {}),
+      row.daterec ?? "",
+    );
+
+    return {
+      id: row.id,
+      record_date: row.daterec,
+      farm: placement?.farm_name ?? null,
+      building: placement?.building_no ?? null,
+      pen: placement?.pen_no ?? null,
+      age,
+      week_no: formatWeeksDays(age),
+      female_qty_old: row.female_qty_old,
+      female_qty_new: row.female_qty_new,
+      male_qty_old: row.male_qty_old,
+      male_qty_new: row.male_qty_new,
+      remarks: row.remarks,
+    };
+  }) as GradingFarmHistory[];
 }
 
 export async function getGradingPlacementById(id: number) {
   const { data, error } = await db
     .from(PLACEMENT_TABLE)
     .select(
-      "id, placement_date, dr_no, farm_id, farm_name, building_no, pen_no, f_endingbalance, m_endingbalance",
+      "id, placement_date, age_anchor_date, dr_no, farm_id, farm_name, building_no, pen_no, f_endingbalance, m_endingbalance",
     )
     .eq("id", id)
     .single();
 
-  if (error) throw error;
+  throwSupabaseError(error);
   return data as GradingPlacement;
+}
+
+function getAgeInDays(placementDate?: string | null, endDateValue?: string) {
+  if (!placementDate || !endDateValue) return 0;
+  const start = new Date(`${placementDate}T00:00:00`);
+  const end = new Date(`${endDateValue}T00:00:00`);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return 0;
+  const elapsedDays = Math.floor(
+    (Date.UTC(end.getFullYear(), end.getMonth(), end.getDate()) -
+      Date.UTC(start.getFullYear(), start.getMonth(), start.getDate())) /
+      86_400_000,
+  );
+
+  return elapsedDays < 0 ? 0 : elapsedDays + 1;
+}
+
+function formatWeeksDays(days: number) {
+  if (days <= 0) return "0.0";
+  return `${Math.floor(days / 7)}.${days % 7}`;
 }

@@ -1,0 +1,391 @@
+import { saveBreederDispatchTransaction } from "@/lib/data/mutations/breederDispatch";
+import { listAssignedUserFarmOptions } from "@/lib/data/repositories/farmOptions.client";
+import { listBreederEggLayings } from "@/app/jmb/lib/data/repositories/breederEggLaying";
+import { EGG_DISPATCH_CATEGORIES, eggDispatchQuantity } from "@/app/jmb/lib/breederEggCategories";
+import { db } from "@/lib/Supabase/supabaseClient";
+import type { DefaultFarm } from "@/lib/types";
+import { compareNaturalText } from "@/lib/utils/naturalSort";
+import type { Placement } from "../../placement/new/api";
+
+const HEADER_TABLE = "tbl_brd_dispatch";
+const LINE_TABLE = "tbl_brd_dispatch_line";
+const REGISTER_VIEW = "brd_dispatch_register";
+const HATCHERY_FARM_VIEW = "view_brd_hatchery_farm_lookup";
+const FARM_LOCATION_LOOKUP_VIEW = "view_farm_new_lookup";
+const SOURCE_PAGE_SIZE = 1000;
+const DISPATCH_ID_CHUNK_SIZE = 300;
+
+export type DispatchStatus = "Draft" | "Posted" | "Cancelled";
+export type DispatchSourceType = "Population Record" | "Egg Laying";
+export const POPULATION_CATEGORIES = [["mc", "Mortality"], ["condemn", "Condemn"], ["kitchen", "Kitchen"], ["culls", "Culls"]] as const;
+export const EGG_CATEGORIES = EGG_DISPATCH_CATEGORIES;
+
+export function dispatchCategoryOrder(source: DispatchSourceType, category: string) {
+  const categories = source === "Population Record" ? POPULATION_CATEGORIES : EGG_CATEGORIES;
+  const index = categories.findIndex(([value]) => value === category);
+  return index < 0 ? categories.length : index;
+}
+
+export type HatcheryFarmLookup = {
+  farm_id: number;
+  farm_code: string | null;
+  farm_name: string;
+};
+
+export type BreederDispatchBuilding = {
+  farm_id: number;
+  farm_code: string | null;
+  farm_name: string;
+  building_id: number;
+  building_code: string | null;
+  building_name: string;
+};
+
+export type BreederDispatchRecord = {
+  id: number; document_no: string; dispatch_date: string; farm_id: number; farm_code: string | null;
+  created_by?: string | null; createdByName?: string; assignedTaLabel?: string;
+  farm_name: string; destination: string; farm_destination_id: number | null; hauler_name: string | null; plate_number: string | null;
+  truck_seal: string | null; status: DispatchStatus; remarks: string | null; line_count: number;
+  population_qty: number; egg_qty: number; total_qty: number; created_at: string;
+};
+
+export type BreederDispatchLine = {
+  id?: number; dispatch_id?: number; line_no: number; source_type: DispatchSourceType;
+  source_record_id: number; source_date: string; category: string; category_label: string;
+  placement_id: number | null; placement_date: string | null; building_id: number | null;
+  building_name: string; pen_id: number | null; pen_name: string | null; dr_no: string | null;
+  source_available: number; dispatch_qty: number; remarks: string | null;
+};
+
+export type BreederDispatchDetail = BreederDispatchRecord & { lines: BreederDispatchLine[] };
+export type AvailableDispatchItem = Omit<BreederDispatchLine, "id" | "dispatch_id" | "line_no" | "dispatch_qty" | "remarks"> & {
+  key: string; farm_id: number; farm_code: string | null; farm_name: string;
+  source_quantity: number; dispatch_quantity: number;
+};
+export type AvailableBreederFlock = Placement & {
+  farm_code: string | null; male_available: number; female_available: number;
+  avg_body_weight_male: number | null; avg_body_weight_female: number | null;
+};
+export type BreederDispatchInput = {
+  dispatch_date: string; farm_id: number; farm_code: string | null; farm_name: string;
+  destination: string; farm_destination_id: number | null; hauler_name: string | null; plate_number: string | null; truck_seal: string | null;
+  remarks: string | null; lines: Omit<BreederDispatchLine, "id" | "dispatch_id">[];
+};
+
+const count = (value: unknown) => { const parsed = Number(value ?? 0); return Number.isFinite(parsed) ? parsed : 0; };
+export const dispatchItemKey = (type: DispatchSourceType, id: number, category: string) => `${type}:${id}:${category}`;
+
+async function currentUserId() {
+  const { data, error } = await db.auth.getUser();
+  if (error) throw error;
+  if (!data.user) throw new Error("Your session has expired. Please sign in again.");
+  return data.user.id;
+}
+
+function documentNo() {
+  const stamp = new Date().toISOString().replace(/\D/g, "").slice(0, 14);
+  return `BRD-DR-${stamp}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+}
+
+export async function getDefaultFarm() {
+  const { data: auth } = await db.auth.getSession();
+  if (!auth.session?.user.id) return null;
+  const { data, error } = await db.from("vwdmf_user_default_farm").select("*").eq("auth_id", auth.session.user.id).limit(1);
+  if (error) throw error;
+  return ((data ?? [])[0] as DefaultFarm | undefined) ?? null;
+}
+
+export async function listHatcheryFarms() {
+  const { data, error } = await db
+    .from(HATCHERY_FARM_VIEW)
+    .select("farm_id, farm_code, farm_name")
+    .order("farm_name");
+  if (error) throw error;
+  return (data ?? []) as HatcheryFarmLookup[];
+}
+
+/** Lists buildings on the current user's assigned Breeder farms, including empty buildings. */
+export async function listBreederDispatchBuildings() {
+  const assignedFarms = await listAssignedUserFarmOptions(["BE", "Breeder"]);
+  const assignedFarmIds = assignedFarms
+    .map((farm) => Number(farm.id))
+    .filter((farmId) => Number.isInteger(farmId) && farmId > 0);
+  if (!assignedFarmIds.length) return [] as BreederDispatchBuilding[];
+
+  const { data, error } = await db
+    .from(FARM_LOCATION_LOOKUP_VIEW)
+    .select("farm_id, farm_code, farm_name, building_id, building_code, building_name")
+    .in("farm_id", assignedFarmIds)
+    .order("building_name", { ascending: true });
+  if (error) throw error;
+
+  return [...new Map(
+    (data ?? []).map((row) => [
+      `${row.farm_id}:${row.building_id}`,
+      row as BreederDispatchBuilding,
+    ]),
+  ).values()];
+}
+
+export async function listBreederDispatches() {
+  const { data, error } = await db.from(REGISTER_VIEW).select("*").order("dispatch_date", { ascending: false }).order("id", { ascending: false });
+  if (error) throw error;
+  return (data ?? []) as BreederDispatchRecord[];
+}
+
+// Retained as the shared live-bird balance provider used by Breeder Cleanup.
+export async function listAvailableBreederFlocks(dispatchDate: string, farmId?: number) {
+  let placementQuery = db.from("tbl_placement").select("*").lte("placement_date", dispatchDate);
+  if (farmId) placementQuery = placementQuery.eq("farm_id", farmId);
+  const [{ data: placements, error: placementError }, { data: farms, error: farmError }] = await Promise.all([
+    placementQuery, db.from("view_breeder_farm").select("id, code"),
+  ]);
+  if (placementError) throw placementError;
+  if (farmError) throw farmError;
+  const placementIds = (placements ?? []).map((row) => row.id);
+  let dailyRows: Record<string, unknown>[] = [];
+  if (placementIds.length) {
+    const { data, error } = await db.from("tbl_breeder_daily_performance").select("placement_id, daterec, inv_male, inv_female, mc_male, mc_female, cull_male, cull_female, trans_in_male, trans_in_female, trans_out_male, trans_out_female, kitchen_male, kitchen_female, condem_male, condem_female, avg_body_weight_male, avg_body_weight_female").in("placement_id", placementIds).eq("isactive", true).lte("daterec", dispatchDate).order("daterec");
+    if (error) throw error;
+    dailyRows = data ?? [];
+  }
+  const byPlacement = new Map<number, Record<string, unknown>[]>();
+  dailyRows.forEach((row) => { const id = Number(row.placement_id); byPlacement.set(id, [...(byPlacement.get(id) ?? []), row]); });
+  const farmCode = new Map((farms ?? []).map((row) => [Number(row.id), row.code as string | null]));
+  return ((placements ?? []) as Placement[]).sort((left, right) =>
+    compareNaturalText(left.building_no, right.building_no) ||
+    compareNaturalText(left.pen_no, right.pen_no) ||
+    left.id - right.id,
+  ).map((placement): AvailableBreederFlock => {
+    const rows = byPlacement.get(placement.id) ?? [];
+    let male = count(placement.m_endingbalance ?? placement.m_beg - placement.m_doa - placement.m_reject - placement.m_shortcount);
+    let female = count(placement.f_endingbalance ?? placement.f_beg - placement.f_doa - placement.f_reject - placement.f_shortcount);
+    rows.forEach((row) => {
+      male += count(row.trans_in_male) - count(row.mc_male) - count(row.cull_male) - count(row.trans_out_male) - count(row.kitchen_male) - count(row.condem_male);
+      female += count(row.trans_in_female) - count(row.mc_female) - count(row.cull_female) - count(row.trans_out_female) - count(row.kitchen_female) - count(row.condem_female);
+    });
+    const latest = rows.at(-1);
+    return { ...placement, farm_code: farmCode.get(placement.farm_id) ?? null, male_available: Math.max(0, male), female_available: Math.max(0, female), avg_body_weight_male: count(latest?.avg_body_weight_male) || placement.m_avg_bodyw, avg_body_weight_female: count(latest?.avg_body_weight_female) || placement.f_avg_bodyw };
+  }).filter((row) => row.male_available > 0 || row.female_available > 0);
+}
+
+/** Reads every Posted allocation visible to the caller; Supabase caps each response page. */
+async function listPostedDispatchAllocationLines(farmId?: number) {
+  const postedIds: number[] = [];
+  for (let offset = 0; ; offset += SOURCE_PAGE_SIZE) {
+    let query = db
+      .from(HEADER_TABLE)
+      .select("id")
+      .eq("status", "Posted")
+      .order("id")
+      .range(offset, offset + SOURCE_PAGE_SIZE - 1);
+    if (farmId) query = query.eq("farm_id", farmId);
+    const { data, error } = await query;
+    if (error) throw error;
+    postedIds.push(...(data ?? []).map((row) => Number(row.id)));
+    if ((data?.length ?? 0) < SOURCE_PAGE_SIZE) break;
+  }
+
+  const lines: Array<{
+    source_type: DispatchSourceType;
+    source_record_id: number;
+    category: string;
+    dispatch_qty: number | null;
+  }> = [];
+  for (let start = 0; start < postedIds.length; start += DISPATCH_ID_CHUNK_SIZE) {
+    const dispatchIds = postedIds.slice(start, start + DISPATCH_ID_CHUNK_SIZE);
+    for (let offset = 0; ; offset += SOURCE_PAGE_SIZE) {
+      const { data, error } = await db
+        .from(LINE_TABLE)
+        .select("source_type, source_record_id, category, dispatch_qty")
+        .in("dispatch_id", dispatchIds)
+        .order("id")
+        .range(offset, offset + SOURCE_PAGE_SIZE - 1);
+      if (error) throw error;
+      lines.push(...((data ?? []) as typeof lines));
+      if ((data?.length ?? 0) < SOURCE_PAGE_SIZE) break;
+    }
+  }
+  return lines;
+}
+
+/**
+ * Returns dispatch source records with their remaining quantity as of a dispatch date.
+ * `includeZeroAvailability` is useful for selection grids that must expose an
+ * exhausted source/building as a visible zero, while the default keeps the
+ * regular dispatch and report lists focused on available inventory.
+ */
+export async function listAvailableDispatchItems(dispatchDate: string, farmId?: number, includeZeroAvailability = false) {
+  let placementQuery = db.from("tbl_placement").select("id, placement_date, dr_no, farm_id, farm_name, building_id, building_no, pen_id, pen_no").lte("placement_date", dispatchDate);
+  if (farmId) placementQuery = placementQuery.eq("farm_id", farmId);
+  const [{ data: placements, error: placementError }, { data: farms, error: farmError }] = await Promise.all([
+    placementQuery, db.from("view_breeder_farm").select("id, code"),
+  ]);
+  if (placementError) throw placementError;
+  if (farmError) throw farmError;
+  const placementById = new Map((placements ?? []).map((row) => [Number(row.id), row]));
+  const placementIds = [...placementById.keys()];
+  const farmCodeById = new Map((farms ?? []).map((row) => [Number(row.id), row.code as string | null]));
+  if (!placementIds.length) return [] as AvailableDispatchItem[];
+
+  const [{ data: population, error: populationError }, eggs, postedLines] = await Promise.all([
+    db.from("tbl_breeder_daily_performance").select("id, placement_id, daterec, mc_male, mc_female, cull_male, cull_female, kitchen_male, kitchen_female, condem_male, condem_female").in("placement_id", placementIds).eq("isactive", true).lte("daterec", dispatchDate),
+    listBreederEggLayings({ placementIds, to: dispatchDate }),
+    listPostedDispatchAllocationLines(farmId),
+  ]);
+  if (populationError) throw populationError;
+
+  const allocated = new Map<string, number>();
+  postedLines.forEach((line) => {
+    const key = dispatchItemKey(line.source_type, Number(line.source_record_id), line.category);
+    allocated.set(key, (allocated.get(key) ?? 0) + count(line.dispatch_qty));
+  });
+
+  const items: AvailableDispatchItem[] = [];
+  for (const row of population ?? []) {
+    const placement = placementById.get(Number(row.placement_id));
+    if (!placement) continue;
+    const values: Record<string, number> = { mc: count(row.mc_male) + count(row.mc_female), culls: count(row.cull_male) + count(row.cull_female), kitchen: count(row.kitchen_male) + count(row.kitchen_female), condemn: count(row.condem_male) + count(row.condem_female) };
+    for (const [category, label] of POPULATION_CATEGORIES) {
+      const key = dispatchItemKey("Population Record", Number(row.id), category);
+      const available = Math.max(0, values[category] - (allocated.get(key) ?? 0));
+      if (!includeZeroAvailability && !available) continue;
+      items.push({ key, source_type: "Population Record", source_record_id: Number(row.id), source_date: row.daterec, category, category_label: label, placement_id: Number(placement.id), placement_date: placement.placement_date, building_id: placement.building_id, building_name: placement.building_no ?? "-", pen_id: placement.pen_id, pen_name: placement.pen_no, dr_no: placement.dr_no, source_quantity: values[category], dispatch_quantity: allocated.get(key) ?? 0, source_available: available, farm_id: Number(placement.farm_id), farm_code: farmCodeById.get(Number(placement.farm_id)) ?? null, farm_name: placement.farm_name ?? "-" });
+    }
+  }
+  for (const row of eggs ?? []) {
+    const placement = placementById.get(Number(row.placement_id));
+    if (!placement) continue;
+    for (const [category, label] of EGG_CATEGORIES) {
+      const key = dispatchItemKey("Egg Laying", Number(row.id), category);
+      const quantity = eggDispatchQuantity(row, category);
+      const available = Math.max(0, quantity - (allocated.get(key) ?? 0));
+      if (!includeZeroAvailability && !available) continue;
+      items.push({ key, source_type: "Egg Laying", source_record_id: Number(row.id), source_date: row.date_laying, category, category_label: label, placement_id: Number(placement.id), placement_date: placement.placement_date, building_id: row.building_id ?? placement.building_id, building_name: row.building ?? placement.building_no ?? "-", pen_id: placement.pen_id, pen_name: placement.pen_no, dr_no: placement.dr_no, source_quantity: quantity, dispatch_quantity: allocated.get(key) ?? 0, source_available: available, farm_id: Number(row.farm_id ?? placement.farm_id), farm_code: farmCodeById.get(Number(row.farm_id ?? placement.farm_id)) ?? null, farm_name: row.farm_name ?? placement.farm_name ?? "-" });
+    }
+  }
+  return items.sort((a, b) => b.source_date.localeCompare(a.source_date) || a.building_name.localeCompare(b.building_name) || a.category_label.localeCompare(b.category_label));
+}
+
+export async function getBreederDispatchById(id: number) {
+  const [{ data: header, error: headerError }, { data: lines, error: lineError }] = await Promise.all([
+    db.from(REGISTER_VIEW).select("*").eq("id", id).single(), db.from(LINE_TABLE).select("*").eq("dispatch_id", id).order("line_no"),
+  ]);
+  if (headerError) throw headerError;
+  if (lineError) throw lineError;
+  return { ...header, lines: lines ?? [] } as BreederDispatchDetail;
+}
+
+async function validateInput(input: BreederDispatchInput) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(input.dispatch_date)) throw new Error("Dispatch date is required.");
+  if (!Number.isInteger(input.farm_id) || input.farm_id <= 0) throw new Error("Breeder farm is required.");
+  if (!input.destination.trim()) throw new Error("Destination is required.");
+  const walkInCustomer = input.destination.startsWith("Walk-in Customer - ");
+  if (walkInCustomer && input.farm_destination_id !== null) throw new Error("Walk-in customers cannot have a destination farm ID.");
+  if (!walkInCustomer) {
+    if (!Number.isInteger(input.farm_destination_id) || Number(input.farm_destination_id) <= 0) throw new Error("Destination Hatchery farm is required.");
+    const destinationFarm = (await listHatcheryFarms()).find((farm) => farm.farm_id === input.farm_destination_id);
+    if (!destinationFarm || destinationFarm.farm_name !== input.destination) throw new Error("The selected destination does not match an active Hatchery farm.");
+  }
+  if (!input.lines.length) throw new Error("Add at least one dispatch category.");
+  const keys = input.lines.map((line) => dispatchItemKey(line.source_type, line.source_record_id, line.category));
+  if (new Set(keys).size !== keys.length) throw new Error("A source category can only appear once.");
+  const availableByKey = new Map((await listAvailableDispatchItems(input.dispatch_date, input.farm_id)).map((row) => [row.key, row]));
+  for (const line of input.lines) {
+    const item = availableByKey.get(dispatchItemKey(line.source_type, line.source_record_id, line.category));
+    if (!item) throw new Error(`${line.category_label} is no longer available from the selected source record.`);
+    if (item.building_id !== line.building_id) throw new Error(`${line.category_label} does not match the selected source building.`);
+    if (!Number.isInteger(Number(line.dispatch_qty)) || Number(line.dispatch_qty) <= 0) throw new Error("Dispatch quantities must be positive whole numbers.");
+    if (Number(line.dispatch_qty) > item.source_available) throw new Error(`${line.category_label} exceeds the available quantity for ${line.building_name}.`);
+  }
+}
+
+async function replaceLines(id: number, lines: BreederDispatchInput["lines"], userId: string) {
+  const existing = await getBreederDispatchById(id);
+  const existingBySource = new Map(
+    existing.lines
+      .filter((line) => Number.isInteger(line.id) && Number(line.id) > 0)
+      .map((line) => [dispatchItemKey(line.source_type, line.source_record_id, line.category), line]),
+  );
+  const retainedSourceKeys = new Set(
+    lines.map((line) => dispatchItemKey(line.source_type, line.source_record_id, line.category)),
+  );
+  const needsTemporaryLineNumbers = existing.lines.some((line) => {
+    const sourceKey = dispatchItemKey(line.source_type, line.source_record_id, line.category);
+    const newLineIndex = lines.findIndex((nextLine) =>
+      dispatchItemKey(nextLine.source_type, nextLine.source_record_id, nextLine.category) === sourceKey,
+    );
+    return newLineIndex < 0 || Number(line.line_no) !== newLineIndex + 1;
+  });
+
+  // Move numbers only when rows were reordered, added in the middle, or removed.
+  // An unchanged draft posts through updates without altering its saved line numbers.
+  if (needsTemporaryLineNumbers) {
+    await Promise.all(existing.lines.map(async (line) => {
+      if (!Number.isInteger(line.id) || Number(line.id) <= 0) return;
+      const { error } = await db
+        .from(LINE_TABLE)
+        .update({ line_no: -Number(line.id) })
+        .eq("id", line.id)
+        .eq("dispatch_id", id);
+      if (error) throw error;
+    }));
+  }
+
+  for (const [index, line] of lines.entries()) {
+    const sourceKey = dispatchItemKey(line.source_type, line.source_record_id, line.category);
+    const persistedLine = { ...line, dispatch_id: id, line_no: index + 1 };
+    const existingLine = existingBySource.get(sourceKey);
+    if (existingLine?.id) {
+      const { error } = await db
+        .from(LINE_TABLE)
+        .update({ ...persistedLine, updated_by: userId })
+        .eq("id", existingLine.id)
+        .eq("dispatch_id", id);
+      if (error) throw error;
+    } else {
+      const { error } = await db
+        .from(LINE_TABLE)
+        .insert({ ...persistedLine, created_by: userId });
+      if (error) throw error;
+    }
+  }
+
+  const removedLineIds = existing.lines
+    .filter((line) => line.id && !retainedSourceKeys.has(dispatchItemKey(line.source_type, line.source_record_id, line.category)))
+    .map((line) => Number(line.id));
+  if (removedLineIds.length) {
+    const { error } = await db.from(LINE_TABLE).delete().in("id", removedLineIds).eq("dispatch_id", id);
+    if (error) throw error;
+  }
+}
+
+export async function createBreederDispatch(input: BreederDispatchInput, post = false) {
+  await validateInput(input);
+  const id = await saveBreederDispatchTransaction(null, input, documentNo(), post);
+  return getBreederDispatchById(id);
+}
+
+export async function updateBreederDispatch(id: number, input: BreederDispatchInput, post = false) {
+  await validateInput(input);
+  await saveBreederDispatchTransaction(id, input, null, post);
+  return getBreederDispatchById(id);
+}
+
+export async function postBreederDispatch(id: number) {
+  const userId = await currentUserId();
+  const { data, error } = await db.from(HEADER_TABLE).update({ status: "Posted", updated_by: userId }).eq("id", id).eq("status", "Draft").select("id").single();
+  if (error) throw error; return data;
+}
+
+export async function cancelBreederDispatch(id: number, reason: string) {
+  if (!reason.trim()) throw new Error("Cancellation reason is required.");
+  const userId = await currentUserId();
+  const { data, error } = await db.from(HEADER_TABLE).update({ status: "Cancelled", cancellation_reason: reason.trim(), cancelled_by: userId, cancelled_at: new Date().toISOString(), updated_by: userId }).eq("id", id).eq("status", "Posted").select("id").single();
+  if (error) throw error; return data;
+}
+
+export async function deleteBreederDispatchDraft(id: number) {
+  const { error } = await db.from(HEADER_TABLE).delete().eq("id", id).eq("status", "Draft");
+  if (error) throw error;
+}

@@ -2,10 +2,9 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { CalendarDays, ClipboardList, Mars, Venus } from "lucide-react";
+import { CalendarDays, ClipboardList } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import {
   Select,
   SelectContent,
@@ -19,6 +18,8 @@ import FormActionButtons from "@/components/FormActionButtons";
 import RequiredLabel from "@/components/RequiredLabel";
 import SearchableDropdown1 from "@/lib/SearchableDropdown1";
 import { refreshSessionx } from "@/app/admin/user/RefreshSession";
+import { breederAgeAnchorDate } from "@/lib/utils/breederPlacement";
+import { formatFarmNameCodeId } from "@/lib/utils/farmDisplay";
 import {
   createGrowing,
   createGrowingBatch,
@@ -30,6 +31,7 @@ import {
   updateGrowing,
   type FeedType,
   type Growing,
+  type GrowingFarmHistory,
   type GrowingInsert,
   type GrowingPlacement,
 } from "./api";
@@ -96,7 +98,8 @@ function formatDate(value?: string | null) {
 }
 
 function getFeedTypeLabel(feedType: FeedType) {
-  const description = feedType.description?.trim() || `Feed Type #${feedType.id}`;
+  const description =
+    feedType.description?.trim() || `Feed Type #${feedType.id}`;
   return feedType.uom ? `${description} (${feedType.uom})` : description;
 }
 
@@ -106,6 +109,25 @@ function getFeedTypeOptions(feedTypes: FeedType[]) {
     id: String(feedType.id),
     description: getFeedTypeLabel(feedType),
   }));
+}
+
+function getErrorMessage(error: unknown, fallback: string) {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string") return error;
+  if (error && typeof error === "object") {
+    const details = error as {
+      message?: unknown;
+      details?: unknown;
+      hint?: unknown;
+      code?: unknown;
+    };
+    return [details.message, details.details, details.hint, details.code]
+      .filter(
+        (value): value is string => typeof value === "string" && value !== "",
+      )
+      .join("\n");
+  }
+  return fallback;
 }
 
 function getFarmKey(placement: GrowingPlacement) {
@@ -128,8 +150,9 @@ function getAgeInDays(placementDate?: string | null, endDateValue?: string) {
   return elapsedDays < 0 ? 0 : elapsedDays + 1;
 }
 
-function getWeekNumber(days: number) {
-  return days > 0 ? Math.ceil(days / 7) : 0;
+function formatWeeksDays(days: number) {
+  if (days <= 0) return "0.0";
+  return `${Math.floor(days / 7)}.${days % 7}`;
 }
 
 function createInitialForm(): FormState {
@@ -181,6 +204,30 @@ function createPenRowFromGrowing(row: Growing): GrowingPenRow {
   };
 }
 
+const TableWidths = {
+  tableMin: "min-w-[1220px]",
+  pen: "w-[72px] min-w-[72px]",
+  count: "w-[128px] min-w-[128px]",
+  feed: "w-[220px] min-w-[220px]",
+  bodyWeight: "w-[144px] min-w-[144px]",
+} as const;
+
+const SheetClasses = {
+  cell: "border border-slate-200 p-0 align-middle",
+  header:
+    "border border-slate-300 bg-slate-50 px-2 py-2 text-center text-sm font-medium text-slate-700",
+  group:
+    "border border-slate-300 bg-slate-100 px-2 py-2 text-left text-sm font-medium text-slate-700",
+  input:
+    "h-10 rounded-none border-0 bg-transparent text-center shadow-none focus-visible:ring-1 focus-visible:ring-emerald-700 focus-visible:ring-offset-0 disabled:cursor-default disabled:opacity-100",
+  inputWithUnit:
+    "h-10 rounded-none border-0 bg-transparent pr-9 text-center shadow-none focus-visible:ring-1 focus-visible:ring-emerald-700 focus-visible:ring-offset-0 disabled:cursor-default disabled:opacity-100",
+  readOnlyInput:
+    "h-10 rounded-none border-0 bg-slate-50 text-center text-slate-600 shadow-none disabled:cursor-default disabled:opacity-100",
+  dropdown:
+    "h-10 rounded-none border-0 bg-transparent text-center text-sm !font-normal shadow-none hover:bg-transparent focus:ring-1 focus:ring-emerald-700 focus:ring-offset-0",
+} as const;
+
 export default function GrowingForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -196,24 +243,24 @@ export default function GrowingForm() {
   const [selectedBuildingNo, setSelectedBuildingNo] = useState("");
   const [selectedPlacement, setSelectedPlacement] =
     useState<GrowingPlacement | null>(null);
-  const [history, setHistory] = useState<Growing[]>([]);
+  const [history, setHistory] = useState<GrowingFarmHistory[]>([]);
   const [loadingRecord, setLoadingRecord] = useState(false);
   const [loadingFeedTypes, setLoadingFeedTypes] = useState(false);
   const [saving, setSaving] = useState(false);
 
   const disabledAll = saving || loadingRecord;
   const ageDays = selectedPlacement
-    ? getAgeInDays(selectedPlacement.placement_date, form.daterec)
+    ? getAgeInDays(breederAgeAnchorDate(selectedPlacement), form.daterec)
     : 0;
-  const weekNumber = getWeekNumber(ageDays);
+  const weekNumber = formatWeeksDays(ageDays);
   const farmOptions = useMemo(() => {
-    const values = new Map<string, string>();
+    const values = new Map<string, { name: string; code: string | null | undefined }>();
     placements.forEach((placement) => {
       const farmId = getFarmKey(placement);
       const farmName = placement.farm_name?.trim() ?? "";
-      if (farmId && farmName) values.set(farmId, farmName);
+      if (farmId && farmName) values.set(farmId, { name: farmName, code: placement.farm_code });
     });
-    return Array.from(values, ([id, name]) => ({ id, name })).sort((a, b) =>
+    return Array.from(values, ([id, farm]) => ({ id, name: formatFarmNameCodeId(farm.name, farm.code, id) })).sort((a, b) =>
       a.name.localeCompare(b.name),
     );
   }, [placements]);
@@ -377,7 +424,10 @@ export default function GrowingForm() {
   }, [idParam, router]);
 
   useEffect(() => {
-    if (!selectedPlacement?.farm_id && !selectedPlacement?.farm_name) {
+    if (
+      (!selectedPlacement?.farm_id && !selectedPlacement?.farm_name) ||
+      !selectedBuildingNo
+    ) {
       setHistory([]);
       return;
     }
@@ -387,6 +437,7 @@ export default function GrowingForm() {
         const rows = await listGrowingHistoryByFarm({
           farmId: selectedPlacement.farm_id ?? null,
           farmName: selectedPlacement.farm_name ?? null,
+          buildingNo: selectedBuildingNo,
         });
         setHistory(rows);
       } catch (error) {
@@ -395,7 +446,11 @@ export default function GrowingForm() {
         alert(message);
       }
     })();
-  }, [selectedPlacement?.farm_id, selectedPlacement?.farm_name]);
+  }, [
+    selectedBuildingNo,
+    selectedPlacement?.farm_id,
+    selectedPlacement?.farm_name,
+  ]);
 
   function handleGrowingRowChange(
     placementId: string,
@@ -419,6 +474,46 @@ export default function GrowingForm() {
           : row,
       ),
     );
+  }
+
+  function handleGrowingGridKeyDown(
+    event: React.KeyboardEvent<HTMLTableElement>,
+  ) {
+    const movement: Record<string, [number, number]> = {
+      ArrowLeft: [0, -1],
+      ArrowRight: [0, 1],
+      ArrowUp: [-1, 0],
+      ArrowDown: [1, 0],
+    };
+    const offset = movement[event.key];
+    if (!offset) return;
+
+    const target = event.target as HTMLElement;
+    const currentCell = target.closest("td");
+    const currentRow = currentCell?.parentElement;
+    const tableBody = currentRow?.parentElement;
+    if (
+      !currentCell ||
+      !currentRow ||
+      !tableBody ||
+      tableBody.tagName !== "TBODY"
+    )
+      return;
+
+    const rows = Array.from(tableBody.querySelectorAll("tr"));
+    const cells = Array.from(currentRow.querySelectorAll("td"));
+    const rowIndex = rows.indexOf(currentRow as HTMLTableRowElement);
+    const columnIndex = cells.indexOf(currentCell as HTMLTableCellElement);
+    const nextRow = rows[rowIndex + offset[0]];
+    const nextCell = nextRow?.querySelectorAll("td")[columnIndex + offset[1]];
+    const nextControl = nextCell?.querySelector<HTMLElement>(
+      "input:not([disabled]), button:not([disabled])",
+    );
+    if (!nextControl) return;
+
+    event.preventDefault();
+    nextControl.focus();
+    if (nextControl instanceof HTMLInputElement) nextControl.select();
   }
 
   function buildPayload(row: GrowingPenRow): GrowingInsert {
@@ -473,9 +568,8 @@ export default function GrowingForm() {
 
       router.push("/jmb/growing");
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Failed to save growing.";
-      alert(message);
+      console.error("Failed to save growing", { error, payloads });
+      alert(getErrorMessage(error, "Failed to save growing."));
     } finally {
       setSaving(false);
     }
@@ -594,15 +688,16 @@ export default function GrowingForm() {
                     ["Age (Days)", String(ageDays)],
                     ["Farm", selectedPlacement?.farm_name ?? ""],
                     ["Building", selectedPlacement?.building_no ?? ""],
-                    ["Pen", selectedPlacement?.pen_no ?? ""],
                     ["Week #", String(weekNumber)],
+                    [
+                      "Placement Date",
+                      formatDate(selectedPlacement?.placement_date),
+                    ],
                   ].map(([label, value]) => (
                     <div
                       key={label}
                       className={
-                        label === "Farm" ||
-                        label === "Building" ||
-                        label === "Pen"
+                        label === "Farm" || label === "Building"
                           ? "rounded-md border border-emerald-200 bg-emerald-50 p-3"
                           : "rounded-md border border-slate-200 bg-slate-50 p-3"
                       }
@@ -620,58 +715,95 @@ export default function GrowingForm() {
             </section>
 
             <section className="overflow-hidden rounded-md border border-emerald-100 bg-white">
-              <div className="flex items-center gap-3 border-b px-5 py-4">
-                <span className="flex h-8 w-8 items-center justify-center rounded-md bg-pink-50 text-pink-600">
-                  <Venus className="h-4 w-4" />
-                </span>
-                <h2 className="inline-flex items-center rounded-full bg-pink-50 px-3 py-1 text-xs font-bold text-pink-600">
-                  Female Information
-                </h2>
-              </div>
               <div className="p-5">
                 {growingRows.length ? (
-                  <div className="overflow-x-auto">
-                    <table className="w-full min-w-[980px] border-separate border-spacing-y-2 text-sm">
+                  <div className="overflow-x-auto border border-slate-300 bg-white">
+                    <table
+                      className={`w-full ${TableWidths.tableMin} border-collapse table-fixed text-sm`}
+                      onKeyDownCapture={handleGrowingGridKeyDown}
+                    >
                       <thead>
                         <tr>
-                          <th className="w-24 px-2 text-left align-bottom">
-                            <Label className="text-[11px] font-semibold text-slate-600">
-                              Pen #
-                            </Label>
+                          <th
+                            rowSpan={2}
+                            className={`${SheetClasses.header} ${TableWidths.pen}`}
+                          >
+                            Pen #
                           </th>
-                          <th className="px-2 text-left align-bottom">
-                            <Label className="text-[11px] font-semibold text-slate-600">
-                              Female Mortality
-                            </Label>
+                          <th
+                            colSpan={4}
+                            className={`${SheetClasses.group} bg-pink-100! text-pink-800`}
+                          >
+                            Female
                           </th>
-                          <th className="px-2 text-left align-bottom">
-                            <Label className="text-[11px] font-semibold text-slate-600">
-                              Female Feed Consumption
-                            </Label>
+                          <th
+                            colSpan={4}
+                            className={`${SheetClasses.group} bg-sky-100! text-sky-800`}
+                          >
+                            Male
                           </th>
-                          <th className="px-2 text-left align-bottom">
-                            <Label className="text-[11px] font-semibold text-slate-600">
-                              Female Feed Type
-                            </Label>
+                        </tr>
+                        <tr>
+                          <th
+                            className={`${SheetClasses.header} ${TableWidths.count} bg-pink-50!`}
+                          >
+                            Mortality
                           </th>
-                          <th className="px-2 text-left align-bottom">
-                            <Label className="text-[11px] font-semibold text-slate-600">
-                              Female Body Weight
-                            </Label>
+                          <th
+                            className={`${SheetClasses.header} ${TableWidths.count} bg-pink-50!`}
+                          >
+                            Feed Consumption
+                          </th>
+                          <th
+                            className={`${SheetClasses.header} ${TableWidths.feed} bg-pink-50!`}
+                          >
+                            Feed Type (Optional)
+                          </th>
+                          <th
+                            className={`${SheetClasses.header} ${TableWidths.bodyWeight} bg-pink-50!`}
+                          >
+                            Body Weight
+                          </th>
+                          <th
+                            className={`${SheetClasses.header} ${TableWidths.count} bg-sky-50!`}
+                          >
+                            Mortality
+                          </th>
+                          <th
+                            className={`${SheetClasses.header} ${TableWidths.count} bg-sky-50!`}
+                          >
+                            Feed Consumption
+                          </th>
+                          <th
+                            className={`${SheetClasses.header} ${TableWidths.feed} bg-sky-50!`}
+                          >
+                            Feed Type (Optional)
+                          </th>
+                          <th
+                            className={`${SheetClasses.header} ${TableWidths.bodyWeight} bg-sky-50!`}
+                          >
+                            Body Weight
                           </th>
                         </tr>
                       </thead>
                       <tbody>
                         {growingRows.map((row) => (
-                          <tr key={`female-${row.placement_id}`}>
-                            <td className="w-24 px-2 align-top">
+                          <tr
+                            key={row.placement_id}
+                            className="even:bg-white odd:bg-emerald-50/40"
+                          >
+                            <td
+                              className={`${SheetClasses.cell} ${TableWidths.pen} bg-slate-50`}
+                            >
                               <Input
                                 value={row.pen_no || "-"}
-                                disabled
-                                className="h-10 rounded-md border-emerald-100 bg-slate-50 text-sm shadow-none"
+                                readOnly
+                                className={SheetClasses.readOnlyInput}
                               />
                             </td>
-                            <td className="px-2 align-top">
+                            <td
+                              className={`${SheetClasses.cell} ${TableWidths.count}`}
+                            >
                               <Input
                                 type="text"
                                 inputMode="numeric"
@@ -684,10 +816,12 @@ export default function GrowingForm() {
                                   )
                                 }
                                 disabled={disabledAll}
-                                className="h-10 rounded-md border-emerald-100 bg-slate-50 text-sm shadow-none focus-visible:ring-emerald-500"
+                                className={SheetClasses.input}
                               />
                             </td>
-                            <td className="px-2 align-top">
+                            <td
+                              className={`${SheetClasses.cell} ${TableWidths.count}`}
+                            >
                               <div className="relative">
                                 <Input
                                   type="text"
@@ -702,19 +836,22 @@ export default function GrowingForm() {
                                     )
                                   }
                                   disabled={disabledAll}
-                                  className="h-10 rounded-md border-emerald-100 bg-slate-50 pr-10 text-sm shadow-none focus-visible:ring-emerald-500"
+                                  className={SheetClasses.inputWithUnit}
                                 />
-                                <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] font-semibold text-slate-500">
+                                <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[10px] font-semibold text-slate-500">
                                   kg
                                 </span>
                               </div>
                             </td>
-                            <td className="px-2 align-top">
+                            <td
+                              className={`${SheetClasses.cell} ${TableWidths.feed}`}
+                            >
                               <SearchableDropdown1
                                 list={feedTypeOptions}
                                 codeLabel="id"
                                 nameLabel="description"
                                 showNameOnly
+                                clearable
                                 value={
                                   row.female_feedtype_id
                                     ? [row.female_feedtype_id]
@@ -735,9 +872,12 @@ export default function GrowingForm() {
                                       : "No feed type descriptions found"
                                 }
                                 disabled={disabledAll || loadingFeedTypes}
+                                triggerClassName={SheetClasses.dropdown}
                               />
                             </td>
-                            <td className="px-2 align-top">
+                            <td
+                              className={`${SheetClasses.cell} ${TableWidths.bodyWeight}`}
+                            >
                               <div className="relative">
                                 <Input
                                   type="text"
@@ -752,79 +892,16 @@ export default function GrowingForm() {
                                     )
                                   }
                                   disabled={disabledAll}
-                                  className="h-10 rounded-md border-emerald-100 bg-slate-50 pr-10 text-sm shadow-none focus-visible:ring-emerald-500"
+                                  className={SheetClasses.inputWithUnit}
                                 />
-                                <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] font-semibold text-slate-500">
+                                <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[10px] font-semibold text-slate-500">
                                   kg
                                 </span>
                               </div>
                             </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                ) : (
-                  <div className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">
-                    Select a farm and building above to generate pen rows.
-                  </div>
-                )}
-              </div>
-            </section>
-
-            <section className="overflow-hidden rounded-md border border-emerald-100 bg-white">
-              <div className="flex items-center gap-3 border-b px-5 py-4">
-                <span className="flex h-8 w-8 items-center justify-center rounded-md bg-sky-50 text-sky-600">
-                  <Mars className="h-4 w-4" />
-                </span>
-                <h2 className="inline-flex items-center rounded-full bg-sky-50 px-3 py-1 text-xs font-bold text-sky-600">
-                  Male Information
-                </h2>
-              </div>
-              <div className="p-5">
-                {growingRows.length ? (
-                  <div className="overflow-x-auto">
-                    <table className="w-full min-w-[980px] border-separate border-spacing-y-2 text-sm">
-                      <thead>
-                        <tr>
-                          <th className="w-24 px-2 text-left align-bottom">
-                            <Label className="text-[11px] font-semibold text-slate-600">
-                              Pen #
-                            </Label>
-                          </th>
-                          <th className="px-2 text-left align-bottom">
-                            <Label className="text-[11px] font-semibold text-slate-600">
-                              Male Mortality
-                            </Label>
-                          </th>
-                          <th className="px-2 text-left align-bottom">
-                            <Label className="text-[11px] font-semibold text-slate-600">
-                              Male Feed Consumption
-                            </Label>
-                          </th>
-                          <th className="px-2 text-left align-bottom">
-                            <Label className="text-[11px] font-semibold text-slate-600">
-                              Male Feed Type
-                            </Label>
-                          </th>
-                          <th className="px-2 text-left align-bottom">
-                            <Label className="text-[11px] font-semibold text-slate-600">
-                              Male Body Weight
-                            </Label>
-                          </th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {growingRows.map((row) => (
-                          <tr key={`male-${row.placement_id}`}>
-                            <td className="w-24 px-2 align-top">
-                              <Input
-                                value={row.pen_no || "-"}
-                                disabled
-                                className="h-10 rounded-md border-emerald-100 bg-slate-50 text-sm shadow-none"
-                              />
-                            </td>
-                            <td className="px-2 align-top">
+                            <td
+                              className={`${SheetClasses.cell} ${TableWidths.count}`}
+                            >
                               <Input
                                 type="text"
                                 inputMode="numeric"
@@ -837,10 +914,12 @@ export default function GrowingForm() {
                                   )
                                 }
                                 disabled={disabledAll}
-                                className="h-10 rounded-md border-emerald-100 bg-slate-50 text-sm shadow-none focus-visible:ring-emerald-500"
+                                className={SheetClasses.input}
                               />
                             </td>
-                            <td className="px-2 align-top">
+                            <td
+                              className={`${SheetClasses.cell} ${TableWidths.count}`}
+                            >
                               <div className="relative">
                                 <Input
                                   type="text"
@@ -855,19 +934,22 @@ export default function GrowingForm() {
                                     )
                                   }
                                   disabled={disabledAll}
-                                  className="h-10 rounded-md border-emerald-100 bg-slate-50 pr-10 text-sm shadow-none focus-visible:ring-emerald-500"
+                                  className={SheetClasses.inputWithUnit}
                                 />
-                                <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] font-semibold text-slate-500">
+                                <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[10px] font-semibold text-slate-500">
                                   kg
                                 </span>
                               </div>
                             </td>
-                            <td className="px-2 align-top">
+                            <td
+                              className={`${SheetClasses.cell} ${TableWidths.feed}`}
+                            >
                               <SearchableDropdown1
                                 list={feedTypeOptions}
                                 codeLabel="id"
                                 nameLabel="description"
                                 showNameOnly
+                                clearable
                                 value={
                                   row.male_feedtype_id
                                     ? [row.male_feedtype_id]
@@ -888,9 +970,12 @@ export default function GrowingForm() {
                                       : "No feed type descriptions found"
                                 }
                                 disabled={disabledAll || loadingFeedTypes}
+                                triggerClassName={SheetClasses.dropdown}
                               />
                             </td>
-                            <td className="px-2 align-top">
+                            <td
+                              className={`${SheetClasses.cell} ${TableWidths.bodyWeight}`}
+                            >
                               <div className="relative">
                                 <Input
                                   type="text"
@@ -905,9 +990,9 @@ export default function GrowingForm() {
                                     )
                                   }
                                   disabled={disabledAll}
-                                  className="h-10 rounded-md border-emerald-100 bg-slate-50 pr-10 text-sm shadow-none focus-visible:ring-emerald-500"
+                                  className={SheetClasses.inputWithUnit}
                                 />
-                                <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] font-semibold text-slate-500">
+                                <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[10px] font-semibold text-slate-500">
                                   kg
                                 </span>
                               </div>
@@ -940,9 +1025,9 @@ export default function GrowingForm() {
               <div>
                 <h3 className="text-sm font-medium">Growing Farm History</h3>
                 <p className="text-xs text-muted-foreground">
-                  {selectedPlacement?.farm_name
-                    ? `Showing recent transactions for ${selectedPlacement.farm_name}.`
-                    : "Select a placement to show farm history."}
+                  {selectedPlacement?.farm_name && selectedBuildingNo
+                    ? `Showing recent transactions for ${selectedPlacement.farm_name} / ${selectedBuildingNo}.`
+                    : "Select a farm and building to show history."}
                 </p>
               </div>
 
@@ -958,9 +1043,7 @@ export default function GrowingForm() {
                         Building
                       </th>
                       <th className="px-3 py-2 text-left font-medium">Pen</th>
-                      <th className="px-3 py-2 text-right font-medium">
-                        Age
-                      </th>
+                      <th className="px-3 py-2 text-right font-medium">Age</th>
                       <th className="px-3 py-2 text-right font-medium">
                         Week #
                       </th>
@@ -992,40 +1075,40 @@ export default function GrowingForm() {
                   </thead>
                   <tbody>
                     {history.length ? (
-                      history.map((row) => {
-                        const rowAge = getAgeInDays(
-                          row.placement?.placement_date,
-                          row.daterec ?? undefined,
-                        );
+                      history.map((row, index) => {
+                        const rowAge = Number(row.age ?? 0);
 
                         return (
-                          <tr key={row.id} className="border-b last:border-0">
+                          <tr
+                            key={[
+                              index,
+                              row.record_date ?? "",
+                              row.farm ?? "",
+                              row.building ?? "",
+                              row.pen ?? "",
+                            ].join("|")}
+                            className="border-b last:border-0"
+                          >
                             <td className="px-3 py-2">
-                              {formatDate(row.daterec)}
+                              {formatDate(row.record_date)}
                             </td>
-                            <td className="px-3 py-2">
-                              {row.placement?.farm_name ?? ""}
-                            </td>
-                            <td className="px-3 py-2">
-                              {row.placement?.building_no ?? ""}
-                            </td>
-                            <td className="px-3 py-2">
-                              {row.placement?.pen_no ?? ""}
-                            </td>
+                            <td className="px-3 py-2">{row.farm ?? ""}</td>
+                            <td className="px-3 py-2">{row.building ?? ""}</td>
+                            <td className="px-3 py-2">{row.pen ?? ""}</td>
                             <td className="px-3 py-2 text-right">
                               {rowAge.toLocaleString("en-US")}
                             </td>
                             <td className="px-3 py-2 text-right">
-                              {getWeekNumber(rowAge).toLocaleString("en-US")}
+                              {row.week_no ?? formatWeeksDays(rowAge)}
                             </td>
                             <td className="px-3 py-2 text-right">
                               {formatNumber(row.female_mortality)}
                             </td>
                             <td className="px-3 py-2 text-right">
-                              {formatNumber(row.female_feed_consumption)}
+                              {formatNumber(row.female_feed)}
                             </td>
                             <td className="px-3 py-2">
-                              {row.female_feedtype?.description ?? ""}
+                              {row.female_feed_type ?? ""}
                             </td>
                             <td className="px-3 py-2 text-right">
                               {formatNumber(row.female_body_weight)}
@@ -1034,10 +1117,10 @@ export default function GrowingForm() {
                               {formatNumber(row.male_mortality)}
                             </td>
                             <td className="px-3 py-2 text-right">
-                              {formatNumber(row.male_feed_consumption)}
+                              {formatNumber(row.male_feed)}
                             </td>
                             <td className="px-3 py-2">
-                              {row.male_feedtype?.description ?? ""}
+                              {row.male_feed_type ?? ""}
                             </td>
                             <td className="px-3 py-2 text-right">
                               {formatNumber(row.male_body_weight)}

@@ -1,0 +1,621 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import { toast } from "sonner";
+import { getGrowingHarvestBlocker, reverseBroilerGrowing } from "@/lib/data/repositories/broilerGrowing";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  Building2,
+  CalendarDays,
+  FileSpreadsheet,
+  Hash,
+  Pencil,
+  Loader2,
+  Plus,
+  Search,
+  UsersRound,
+} from "lucide-react";
+import SearchableCombobox from "@/components/SearchableCombobox";
+import BroilerCycleSelect from "@/components/broiler/BroilerCycleSelect";
+import { Button } from "@/components/ui/button";
+import {
+  CompactMetric,
+  PageHeader,
+  PageSection,
+  PageSectionDescription,
+  PageSectionHeader,
+  PageSectionTitle,
+  PageShell,
+} from "@/components/ui/page-layout";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import Breadcrumb from "@/lib/Breadcrumb";
+import { useGlobalContext } from "@/lib/context/GlobalContext";
+import { useSyncDefaultFarm } from "@/lib/farms/useDefaultFarmSelection";
+import { getUserFarms } from "@/app/admin/user/new/api";
+import { encryptData } from "@/app/utils/supabase/url-encryption";
+import {
+  getFarmBuildingsForFlockCard,
+  type FarmBuildingListRow,
+} from "./api";
+
+type FeedWarehouseAssociation = {
+  id?: number | null;
+  whse_code?: string | null;
+  whse_name?: string | null;
+  is_default_feed?: boolean | null;
+};
+
+type FeedFarm = {
+  id: number;
+  code: string;
+  name: string | null;
+  farm_id?: number | null;
+  farm_code?: string | null;
+  farm_name?: string | null;
+  address?: string | null;
+  farm_type?: string | null;
+  contact_person?: string | null;
+  associated_warehouses?: FeedWarehouseAssociation[] | string[] | null;
+};
+
+const asArray = <T,>(value: unknown): T[] =>
+  Array.isArray(value) ? value as T[] : [];
+
+function normalizeFarmCode(value: unknown) {
+  return String(value ?? "").trim();
+}
+
+function normalizeFarm(farm: FeedFarm, masterFarms: FeedFarm[] = []): FeedFarm | null {
+  const code = normalizeFarmCode(farm.code ?? farm.farm_code);
+  if (!code) return null;
+
+  const masterFarm = masterFarms.find(candidate => normalizeFarmCode(candidate.code) === code);
+  const id = farm.id ?? farm.farm_id ?? masterFarm?.id ?? null;
+
+  if (id == null) return null;
+
+  return {
+    ...masterFarm,
+    ...farm,
+    id,
+    code,
+    name: farm.name ?? farm.farm_name ?? masterFarm?.name ?? code,
+    associated_warehouses: farm.associated_warehouses ?? masterFarm?.associated_warehouses ?? null,
+  };
+}
+
+function getBuildingStatusClass(status: string) {
+  const value = status.trim().toLowerCase();
+
+  if (["active", "occupied", "in use", "growing"].includes(value)) {
+    return "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300";
+  }
+
+  if (["inactive", "closed", "maintenance"].includes(value)) {
+    return "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300";
+  }
+
+  return "border-slate-200 bg-slate-50 text-slate-700 dark:border-border dark:bg-background dark:text-muted-foreground";
+}
+
+function isActiveBuildingStatus(status: string) {
+  return status.trim().toLowerCase() === "active";
+}
+
+function formatDateValue(value: string) {
+  if (!value) return "-";
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+
+  return date.toLocaleDateString("en-PH", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+}
+
+function formatNumber(value: number) {
+  return value.toLocaleString("en-PH");
+}
+
+const buildingCodeCollator = new Intl.Collator("en", {
+  numeric: true,
+  sensitivity: "base",
+});
+
+function compareBuildingsByCode(left: FarmBuildingListRow, right: FarmBuildingListRow) {
+  return buildingCodeCollator.compare(left.code, right.code) ||
+    buildingCodeCollator.compare(left.name, right.name);
+}
+
+export default function Layout() {
+  const router = useRouter();
+  const { getValue, setValue } = useGlobalContext();
+  const [selectedFarmId, setSelectedFarmId] = useState("");
+  const [selectedCycleId, setSelectedCycleId] = useState("");
+  const [fallbackAssignedFarms, setFallbackAssignedFarms] = useState<FeedFarm[]>([]);
+  const [buildings, setBuildings] = useState<FarmBuildingListRow[]>([]);
+  const [loadingBuildings, setLoadingBuildings] = useState(false);
+  const [buildingError, setBuildingError] = useState("");
+  const [openingAction, setOpeningAction] = useState<string | null>(null);
+  const [reverseTarget, setReverseTarget] = useState<FarmBuildingListRow | null>(null);
+  const [reverseReason, setReverseReason] = useState("");
+  const [reversing, setReversing] = useState(false);
+  const [reverseError, setReverseError] = useState("");
+  const [checkingReverseHarvest, setCheckingReverseHarvest] = useState(false);
+  const [reverseHarvestBlocker, setReverseHarvestBlocker] = useState("");
+  const [refreshVersion, setRefreshVersion] = useState(0);
+
+  const farmMaster = useMemo(() => {
+    const goodsReceiptReferences = getValue("goodsReceiptReferences") as
+      | { farms?: FeedFarm[] }
+      | undefined;
+
+    const referenceFarms = asArray<FeedFarm>(goodsReceiptReferences?.farms);
+    return referenceFarms.length
+      ? referenceFarms
+      : asArray<FeedFarm>(getValue("getFarmDB"));
+  }, [getValue]);
+
+  const sessionUser = getValue("UserInfoAuthSession")?.[0] as
+    | { id?: number | string; user_type?: number | string; users_farms?: unknown[] }
+    | undefined;
+
+  const assignedFarmCodes = useMemo(
+    () => asArray<unknown>(sessionUser?.users_farms).map(normalizeFarmCode).filter(Boolean),
+    [sessionUser?.users_farms],
+  );
+
+  const farms = useMemo(() => {
+    const normalizedMasterFarms = farmMaster
+      .map(farm => normalizeFarm(farm, farmMaster))
+      .filter((farm): farm is FeedFarm => Boolean(farm));
+
+    if (assignedFarmCodes.length > 0) {
+      const assignedCodeSet = new Set(assignedFarmCodes);
+      return normalizedMasterFarms.filter(farm => assignedCodeSet.has(farm.code));
+    }
+
+    return fallbackAssignedFarms
+      .map(farm => normalizeFarm(farm, farmMaster))
+      .filter((farm): farm is FeedFarm => Boolean(farm));
+  }, [assignedFarmCodes, fallbackAssignedFarms, farmMaster]);
+
+  const effectiveSelectedFarmId = useMemo(() => {
+    if (selectedFarmId) return selectedFarmId;
+
+    const defaultFarmId = getValue("DefaultFarmId");
+    const defaultFarm = farms.find(farm => String(farm.id) === String(defaultFarmId));
+
+    return defaultFarm ? String(defaultFarm.id) : "";
+  }, [farms, getValue, selectedFarmId]);
+  useSyncDefaultFarm(effectiveSelectedFarmId);
+
+  const selectedFarm = useMemo(
+    () => farms.find(farm => String(farm.id) === effectiveSelectedFarmId) ?? null,
+    [effectiveSelectedFarmId, farms],
+  );
+
+  useEffect(() => { setSelectedCycleId(""); }, [effectiveSelectedFarmId]);
+
+  const farmOptions = useMemo(
+    () => farms.map(farm => ({
+      code: String(farm.id),
+      name: farm.code ? `${farm.code} - ${farm.name ?? ""}` : farm.name ?? String(farm.id),
+    })),
+    [farms],
+  );
+
+  const visibleBuildings = useMemo(() => {
+    return [...buildings].sort(compareBuildingsByCode);
+  }, [buildings]);
+
+  const occupiedCount = useMemo(
+    () => visibleBuildings.filter(building => building.flockCard).length,
+    [visibleBuildings],
+  );
+  const totalBirdCount = useMemo(
+    () => visibleBuildings.reduce((sum, building) => sum + (building.flockCard?.animalQty ?? 0), 0),
+    [visibleBuildings],
+  );
+  const nextStartDate = useMemo(() => {
+    const dates = visibleBuildings
+      .map(building => building.flockCard?.startDate ?? "")
+      .filter(Boolean)
+      .sort();
+
+    return dates[0] ?? "";
+  }, [visibleBuildings]);
+
+  useEffect(() => {
+    if (assignedFarmCodes.length > 0 || !sessionUser?.id) return;
+
+    let cancelled = false;
+
+    getUserFarms(Number(sessionUser.id))
+      .then(farms => {
+        if (!cancelled) setFallbackAssignedFarms(Array.isArray(farms) ? farms as FeedFarm[] : []);
+      })
+      .catch(error => {
+        console.error(error);
+        if (!cancelled) setFallbackAssignedFarms([]);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [assignedFarmCodes.length, sessionUser?.id]);
+
+  useEffect(() => {
+    if (!selectedFarm || !selectedCycleId) {
+      setBuildings([]);
+      return;
+    }
+
+    const farmId = selectedFarm.id;
+    let cancelled = false;
+
+    async function loadBuildings() {
+      setLoadingBuildings(true);
+      setBuildingError("");
+
+      try {
+        const rows = await getFarmBuildingsForFlockCard(farmId, { farmCycleId: Number(selectedCycleId) });
+        if (!cancelled) setBuildings(rows);
+      } catch (error) {
+        console.error(error);
+        if (!cancelled) {
+          setBuildings([]);
+          setBuildingError("Unable to load buildings for this farm.");
+        }
+      } finally {
+        if (!cancelled) setLoadingBuildings(false);
+      }
+    }
+
+    void loadBuildings();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedCycleId, selectedFarm, refreshVersion]);
+
+  useEffect(() => {
+    if (!reverseTarget) return;
+    let cancelled = false;
+
+    async function checkHarvest() {
+      try {
+        if (!selectedFarm?.id || !reverseTarget?.flockCard?.cardNo) {
+          throw new Error("Unable to identify the farm and flock cycle. Refresh the building list.");
+        }
+        const documentNo = await getGrowingHarvestBlocker(selectedFarm.id, reverseTarget.flockCard.cardNo);
+        if (!cancelled) setReverseHarvestBlocker(documentNo
+          ? `Reverse Growing is blocked by posted Harvest & Delivery ${documentNo}. Reverse all posted harvests for this building and cycle first.`
+          : "");
+      } catch (error) {
+        if (!cancelled) setReverseHarvestBlocker(`Unable to verify harvests. ${error instanceof Error ? error.message : "Close and try again."}`);
+      } finally {
+        if (!cancelled) setCheckingReverseHarvest(false);
+      }
+    }
+
+    void checkHarvest();
+    return () => { cancelled = true; };
+  }, [reverseTarget, selectedFarm?.id]);
+
+  async function confirmReverseGrowing() {
+    if (reversing || checkingReverseHarvest || reverseHarvestBlocker || !reverseTarget?.flockCard?.growingId || !reverseReason.trim()) return;
+    setReversing(true);
+    setReverseError("");
+    try {
+      await reverseBroilerGrowing(reverseTarget.flockCard.growingId, reverseReason);
+      setReverseTarget(null);
+      setValue("brdFcNewContext", null);
+      setRefreshVersion(value => value + 1);
+      toast.success("Growing reversed. The cycle and DOC placement are retained.");
+    } catch (error) {
+      setReverseError(error instanceof Error ? error.message : "Unable to reverse Growing.");
+    } finally {
+      setReversing(false);
+    }
+  }
+
+  function openFlockForm(building: FarmBuildingListRow) {
+    if (!selectedFarm) return;
+
+    setOpeningAction(`flock:${building.key}`);
+
+    const encryptedBuildingId = encryptData([
+      selectedFarm.id,
+      building.key,
+      building.flockCard?.id ?? null,
+    ]);
+
+    router.push(`/brd/fc/${encryptedBuildingId}/add-flock`);
+  }
+
+  function openFlockCardSheet(building: FarmBuildingListRow) {
+    if (!selectedFarm) return;
+    if (!building.flockCard || Number(building.flockCard.animalQty) <= 0) return;
+
+    setOpeningAction(`growing:${building.key}`);
+
+    setValue("brdFcNewContext", {
+      farmId: selectedFarm.id,
+      farmCode: selectedFarm.code,
+      farmName: selectedFarm.name,
+      farmAddress: selectedFarm.address,
+      farmType: selectedFarm.farm_type,
+      farmContact: selectedFarm.contact_person,
+      buildingKey: building.key,
+      buildingId: building.id,
+      buildingCode: building.code,
+      buildingName: building.name,
+      flockCardId: building.flockCard?.id ?? null,
+      cardNo: building.flockCard?.cardNo ?? "",
+      flockAge: building.flockCard?.age ?? null,
+      flockStartDate: building.flockCard?.startDate ?? "",
+      flockCode: building.flockCard?.flockCode || building.flockCard?.cardNo || "",
+      animalQty: building.flockCard?.animalQty ?? null,
+      breed: building.flockCard?.breed ?? "",
+    });
+
+    router.push("/brd/fc/new");
+  }
+
+  return (
+    <PageShell className="pb-6">
+      <PageHeader>
+        <Breadcrumb
+          SecondPreviewPageName="Broiler"
+          SecondPreviewPageLink="/brd"
+          FirstPreviewsPageName="Growing & Farm Condition"
+          FirstPreviewsPageLink="/brd/fc"
+          CurrentPageName="Growing & Farm Condition"
+        />
+      </PageHeader>
+
+      <PageSection>
+        <div className="border-b bg-muted/25 p-3">
+          <div className="grid gap-3 lg:grid-cols-[minmax(280px,0.8fr)_minmax(420px,1.2fr)] lg:items-end">
+            <div className="grid min-w-0 gap-2 sm:grid-cols-2">
+              <div className="space-y-1">
+                <label className="text-xs font-medium">Farm</label>
+                <SearchableCombobox
+                  items={farmOptions}
+                  value={effectiveSelectedFarmId}
+                  onValueChange={setSelectedFarmId}
+                  placeholder="Select farm..."
+                  showCode
+                  className="w-full"
+                />
+              </div>
+              <BroilerCycleSelect
+                farmId={selectedFarm?.id}
+                value={selectedCycleId}
+                onValueChange={cycleId => setSelectedCycleId(cycleId)}
+                className="w-full"
+              />
+            </div>
+
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+              <CompactMetric icon={<Building2 />} label="Buildings" value={loadingBuildings ? "..." : formatNumber(visibleBuildings.length)} />
+              <CompactMetric icon={<Hash />} label="Occupied" value={formatNumber(occupiedCount)} />
+              <CompactMetric icon={<UsersRound />} label="Birds" value={formatNumber(totalBirdCount)} />
+              <CompactMetric icon={<CalendarDays />} label="First start" value={formatDateValue(nextStartDate)} />
+            </div>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 gap-px bg-border sm:grid-cols-4 xl:grid-cols-[0.85fr_0.8fr_0.75fr_1.1fr_3fr]">
+          {[
+            ["Farm code", selectedFarm?.code || "-"],
+            ["Company", "Vitarich"],
+            ["Complex", selectedFarm?.farm_type || "-"],
+            ["Contact", selectedFarm?.contact_person || "-"],
+            ["Location", selectedFarm?.address || "-"],
+          ].map(([label, value]) => (
+            <div
+              key={label}
+              className={label === "Location" ? "col-span-2 min-w-0 bg-card px-3 py-2 sm:col-span-4 xl:col-span-1" : "min-w-0 bg-card px-3 py-2"}
+            >
+              <div className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">{label}</div>
+              <div className="mt-0.5 break-words text-xs font-medium leading-4" title={value}>{value}</div>
+            </div>
+          ))}
+        </div>
+      </PageSection>
+
+      <PageSection>
+        <PageSectionHeader>
+          <div>
+            <PageSectionTitle>Buildings</PageSectionTitle>
+            <PageSectionDescription>Flock placements for the selected farm and cycle.</PageSectionDescription>
+          </div>
+          {!loadingBuildings && selectedFarm && visibleBuildings.length > 0 ? (
+            <span className="shrink-0 rounded-full border bg-background px-2.5 py-1 text-xs font-medium text-muted-foreground">
+              {visibleBuildings.length} {visibleBuildings.length === 1 ? "building" : "buildings"}
+            </span>
+          ) : null}
+        </PageSectionHeader>
+
+        {loadingBuildings ? (
+          <div className="flex items-center justify-center gap-2 bg-card px-4 py-8 text-sm text-muted-foreground">
+            <Loader2 className="size-4 animate-spin" />
+            Loading buildings...
+          </div>
+        ) : buildingError ? (
+          <div className="bg-card p-3">
+            <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-300">
+            {buildingError}
+            </div>
+          </div>
+        ) : !selectedFarm ? (
+          <div className="flex flex-col items-center justify-center gap-2 bg-card px-4 py-8 text-center text-sm text-muted-foreground">
+            <Search className="size-5" />
+            Select a farm first.
+          </div>
+        ) : visibleBuildings.length === 0 ? (
+          <div className="flex flex-col items-center justify-center gap-2 bg-card px-4 py-8 text-center text-sm text-muted-foreground">
+            <Search className="size-5" />
+            No buildings found.
+          </div>
+        ) : (
+          <>
+            <Table className="min-w-[1020px] bg-card text-xs">
+              <TableHeader>
+                <TableRow className="hover:bg-transparent">
+                  <TableHead className="w-[250px]">Actions</TableHead>
+                  <TableHead>Building</TableHead>
+                  <TableHead>Cycle Number</TableHead>
+                  <TableHead>Cycle Age</TableHead>
+                  <TableHead>Actual Age</TableHead>
+                  <TableHead>Start Date</TableHead>
+                  <TableHead>Flock Code</TableHead>
+                  <TableHead className="text-right">Birds</TableHead>
+                  <TableHead>Status</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {visibleBuildings.map((building, index) => {
+                  const flockCard = building.flockCard;
+                  const hasFlockCard = Boolean(flockCard);
+                  const hasDocs = Number(flockCard?.animalQty ?? 0) > 0;
+                  const displayStatus = flockCard ? "Occupied" : building.status;
+                  const canOpenCard = hasFlockCard && !isActiveBuildingStatus(displayStatus);
+                  const growingActionKey = `growing:${building.key}`;
+                  const flockActionKey = `flock:${building.key}`;
+                  const openingGrowing = openingAction === growingActionKey;
+                  const openingFlock = openingAction === flockActionKey;
+
+                  return (
+                    <TableRow
+                      key={`${building.key || "building"}:${building.id ?? building.code}:${building.flockCard?.id ?? "empty"}:${index}`}
+                    >
+                      <TableCell>
+                        <div className="flex gap-1.5">
+                          {Number(sessionUser?.user_type) === 1 && flockCard?.growingId ? (
+                            <Button type="button" size="xs" variant="outline"
+                              className="text-destructive" disabled={openingAction !== null || reversing}
+                              onClick={() => {
+                                setCheckingReverseHarvest(true);
+                                setReverseHarvestBlocker("");
+                                setReverseTarget(building);
+                                setReverseReason("");
+                                setReverseError("");
+                              }}>
+                              Reverse Growing
+                            </Button>
+                          ) : null}
+                          {canOpenCard ? (
+                            <Button
+                              type="button"
+                              size="xs"
+                              variant="outline"
+                              onClick={() => openFlockCardSheet(building)}
+                              disabled={openingAction !== null || !hasDocs}
+                              title={!hasDocs ? "Growing is unavailable because the DOC count is zero." : undefined}
+                              aria-busy={openingGrowing}
+                            >
+                              {openingGrowing ? (
+                                <Loader2 className="size-4 animate-spin" />
+                              ) : (
+                                <FileSpreadsheet className="size-4" />
+                              )}
+                              {openingGrowing ? "Opening..." : "Growing"}
+                            </Button>
+                          ) : null}
+                          <Button
+                            type="button"
+                            size="xs"
+                            variant="outline"
+                            onClick={() => openFlockForm(building)}
+                            disabled={openingAction !== null}
+                            aria-busy={openingFlock}
+                          >
+                            {openingFlock ? (
+                              <Loader2 className="size-4 animate-spin" />
+                            ) : hasFlockCard ? (
+                              <Pencil className="size-4" />
+                            ) : (
+                              <Plus className="size-4" />
+                            )}
+                            {openingFlock ? "Opening..." : hasFlockCard ? "Edit/View" : "Add Flock"}
+                          </Button>
+                        </div>
+                      </TableCell>
+                      <TableCell className="min-w-0">
+                        <div className="truncate text-sm font-semibold">{building.name || "-"}</div>
+                        <div className="truncate text-[10px] text-muted-foreground" >{building.code || index + 1}</div>
+                      </TableCell>
+                      <TableCell>{flockCard?.cycleMask || "-"}</TableCell>
+                      <TableCell className="font-medium">{flockCard ? `${flockCard.age}d` : "-"}</TableCell>
+                      <TableCell className="font-medium">
+                        {flockCard?.actualAge !== null && flockCard?.actualAge !== undefined
+                          ? `${flockCard.actualAge}d`
+                          : "-"}
+                      </TableCell>
+                      <TableCell className="tabular-nums">{flockCard ? formatDateValue(flockCard.startDate) : "-"}</TableCell>
+                      <TableCell className="min-w-0">
+                        <div className="max-w-[220px] truncate font-medium">
+                          {flockCard?.flockCode || flockCard?.cardNo || "-"}
+                        </div>
+                      </TableCell>
+                      <TableCell className="text-right font-medium tabular-nums">
+                        {flockCard ? flockCard.animalQty.toLocaleString("en-PH") : "-"}
+                      </TableCell>
+                      <TableCell>
+                        <span className={`inline-flex max-w-full rounded border px-2 py-0.5 text-xs font-semibold ${getBuildingStatusClass(displayStatus)}`}>
+                          <span className="truncate">{displayStatus || "No status"}</span>
+                        </span>
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+            <div className="border-t bg-muted/10 px-3 py-2 text-right text-xs font-medium text-muted-foreground">
+              Showing {visibleBuildings.length} of {buildings.length} buildings
+            </div>
+          </>
+        )}
+      </PageSection>
+
+      <Dialog open={reverseTarget !== null} onOpenChange={open => { if (!open && !reversing) setReverseTarget(null); }}>
+        <DialogContent showCloseButton={!reversing}>
+          <DialogHeader>
+            <DialogTitle>Reverse Growing</DialogTitle>
+            <DialogDescription>
+              Reverse all mortality and feed intake and clear Growing data for {reverseTarget?.code}
+              {" "}({reverseTarget?.flockCard?.cardNo}). The cycle and DOC placement will remain.
+              Active Harvest or Clean Up records for this building and cycle will block reversal.
+            </DialogDescription>
+          </DialogHeader>
+          <label htmlFor="reverse-growing-reason" className="text-sm font-medium">Reason</label>
+          {checkingReverseHarvest && <p role="status" className="text-sm text-muted-foreground">Checking harvests for this building and cycle…</p>}
+          {reverseHarvestBlocker && <p role="alert" className="text-sm text-destructive">{reverseHarvestBlocker}</p>}
+          <Textarea id="reverse-growing-reason" value={reverseReason} disabled={reversing || checkingReverseHarvest || Boolean(reverseHarvestBlocker)} maxLength={1000}
+            onChange={event => setReverseReason(event.target.value)} placeholder="Enter the reason for reversal" />
+          {reverseError && <p role="alert" className="text-sm text-destructive">{reverseError}</p>}
+          <DialogFooter>
+            <Button variant="outline" disabled={reversing} onClick={() => setReverseTarget(null)}>Cancel</Button>
+            <Button variant="destructive" disabled={reversing || checkingReverseHarvest || Boolean(reverseHarvestBlocker) || !reverseReason.trim()} onClick={() => void confirmReverseGrowing()}>
+              {reversing ? "Reversing..." : "Confirm Reverse Growing"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </PageShell>
+  );
+}

@@ -1,0 +1,194 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import { Ban, CalendarDays, Loader2, MapPin, Pencil, Pill, Plus, RefreshCw, Search } from "lucide-react";
+import { refreshSessionx } from "@/app/admin/user/RefreshSession";
+import BreederListParameters, {
+  isWithinDateRange,
+  useBreederListParameters,
+} from "@/components/breeder/BreederListParameters";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { TablePagination } from "@/components/ui/table-pagination";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { Textarea } from "@/components/ui/textarea";
+import Breadcrumb from "@/lib/Breadcrumb";
+import { useGlobalContext } from "@/lib/context/GlobalContext";
+import { attachProcessListAttributions } from "@/lib/data/repositories/processListAttribution";
+import { cancelMedication, listMedications, type MedicationRecord } from "./new/api";
+
+function formatDate(value?: string | null) {
+  if (!value) return "-";
+  const date = new Date(`${value.slice(0, 10)}T00:00:00`);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString("en-PH");
+}
+
+export default function MedicationTable() {
+  const router = useRouter();
+  const { setValue } = useGlobalContext();
+  const parameters = useBreederListParameters();
+  const [records, setRecords] = useState<MedicationRecord[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("Posted");
+  const [page, setPage] = useState(1);
+  const [cancelRecord, setCancelRecord] = useState<MedicationRecord | null>(null);
+  const [cancelReason, setCancelReason] = useState("");
+  const [cancelling, setCancelling] = useState(false);
+
+  useEffect(() => {
+    void refreshSessionx(router);
+  }, [router]);
+
+  async function load() {
+    setLoading(true);
+    setError("");
+    try {
+      setRecords(await attachProcessListAttributions(await listMedications()));
+    } catch (loadError) {
+      console.error(loadError);
+      setError("Unable to load medication records. Run medication_tables.sql in Supabase if this module is new.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void load();
+    router.prefetch("/jmb/medication/new");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => setValue("loading_g", loading || cancelling), [loading, cancelling, setValue]);
+
+  const filtered = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    return records.filter((row) => {
+      if (parameters.farmId && String(row.farm_id) !== parameters.farmId) return false;
+      if (!isWithinDateRange(row.medication_date, parameters.dateFrom, parameters.dateTo)) return false;
+      if (statusFilter !== "All" && row.status !== statusFilter) return false;
+      if (!query) return true;
+      return [row.document_no, row.farm_name, row.building_name, row.target_names, row.medication_brand, row.medication_type, row.indication, row.route]
+        .some((value) => String(value ?? "").toLowerCase().includes(query));
+    });
+  }, [parameters.dateFrom, parameters.dateTo, parameters.farmId, records, search, statusFilter]);
+  const pageSize = 15;
+  const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const currentPage = Math.min(page, pageCount);
+  const paginatedRecords = useMemo(() => {
+    const start = (currentPage - 1) * pageSize;
+    return filtered.slice(start, start + pageSize);
+  }, [currentPage, filtered]);
+
+  const postedCount = records.filter((row) => row.status === "Posted").length;
+  const activeFarmCount = new Set(records.filter((row) => row.status === "Posted").map((row) => row.farm_id)).size;
+  const thisMonthCount = records.filter((row) => {
+    const date = new Date(`${row.medication_date}T00:00:00`);
+    const now = new Date();
+    return date.getMonth() === now.getMonth() && date.getFullYear() === now.getFullYear();
+  }).length;
+
+  async function confirmCancel() {
+    if (!cancelRecord) return;
+    if (!cancelReason.trim()) {
+      setError("Cancellation reason is required.");
+      return;
+    }
+    setCancelling(true);
+    setError("");
+    try {
+      await cancelMedication(cancelRecord.id, cancelReason);
+      setCancelRecord(null);
+      setCancelReason("");
+      await load();
+    } catch (cancelError) {
+      console.error(cancelError);
+      setError(cancelError instanceof Error ? cancelError.message : "Unable to cancel medication.");
+    } finally {
+      setCancelling(false);
+    }
+  }
+
+  return (
+    <main className="min-h-[calc(100vh-4rem)] pb-10">
+      <div className="mt-4 px-4"><Breadcrumb SecondPreviewPageName="Breeder" CurrentPageName="Medication" /></div>
+
+      <section className="m-3 mt-6 overflow-hidden rounded-xl border bg-card shadow-sm">
+        <div className="border-b bg-muted/30 px-5 py-5">
+          <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+            <div className="flex items-center gap-3">
+              <div className="grid size-10 place-items-center rounded-lg bg-primary/10 text-primary"><Pill className="size-5" /></div>
+              <div><h1 className="text-xl font-semibold">Breeder medication</h1><p className="text-sm text-muted-foreground">Farm, building, and pen treatment register</p></div>
+            </div>
+            <Button onClick={() => router.push("/jmb/medication/new")}><Plus className="size-4" />Add medication</Button>
+          </div>
+
+          <div className="mt-5 grid gap-3 sm:grid-cols-3">
+            <div className="rounded-lg border bg-background p-3"><div className="flex items-center gap-2 text-xs text-muted-foreground"><Pill className="size-3.5" />Active records</div><div className="mt-1 text-xl font-semibold">{postedCount.toLocaleString()}</div></div>
+            <div className="rounded-lg border bg-background p-3"><div className="flex items-center gap-2 text-xs text-muted-foreground"><MapPin className="size-3.5" />Farms covered</div><div className="mt-1 text-xl font-semibold">{activeFarmCount.toLocaleString()}</div></div>
+            <div className="rounded-lg border bg-background p-3"><div className="flex items-center gap-2 text-xs text-muted-foreground"><CalendarDays className="size-3.5" />Records this month</div><div className="mt-1 text-xl font-semibold">{thisMonthCount.toLocaleString()}</div></div>
+          </div>
+        </div>
+
+        <div className="flex flex-col gap-3 border-b p-4">
+          <div className="relative flex-1"><Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" /><Input value={search} onChange={(e) => { setSearch(e.target.value); setPage(1); }} placeholder="Search medication, indication, farm, building, or pen..." className="pl-9" /></div>
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+            <BreederListParameters {...parameters}>
+              <div className="space-y-2 lg:w-40"><Label>Status</Label><select value={statusFilter} onChange={(e) => { setStatusFilter(e.target.value); setPage(1); }} className="h-10 w-full rounded-md border bg-background px-3 text-sm"><option>Posted</option><option>Cancelled</option><option>All</option></select></div>
+            </BreederListParameters>
+            <Button variant="outline" onClick={() => void load()} disabled={loading}><RefreshCw className={`size-4 ${loading ? "animate-spin" : ""}`} />Refresh</Button>
+          </div>
+        </div>
+
+        {error ? <div className="m-4 rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div> : null}
+
+        <Table>
+          <TableHeader><TableRow><TableHead className="w-14 text-center">#</TableHead><TableHead>Date</TableHead><TableHead>Document</TableHead><TableHead>Farm / location</TableHead><TableHead>Medication</TableHead><TableHead>Dosage</TableHead><TableHead>Period</TableHead><TableHead>Route</TableHead><TableHead>Status</TableHead><TableHead>Created by</TableHead><TableHead>Assigned TA</TableHead><TableHead className="text-right">Actions</TableHead></TableRow></TableHeader>
+          <TableBody>
+            {loading ? <TableRow><TableCell colSpan={12} className="h-32 text-center"><Loader2 className="mx-auto size-5 animate-spin text-muted-foreground" /></TableCell></TableRow> : null}
+            {!loading && paginatedRecords.map((row, index) => (
+              <TableRow key={row.id} className={row.status === "Cancelled" ? "opacity-60" : ""}>
+                <TableCell className="text-center font-medium tabular-nums text-muted-foreground">{(currentPage - 1) * pageSize + index + 1}</TableCell>
+                <TableCell className="whitespace-nowrap">{formatDate(row.medication_date)}</TableCell>
+                <TableCell className="font-mono text-xs">{row.document_no}</TableCell>
+                <TableCell><div className="font-medium">{row.farm_name}</div><div className="max-w-72 truncate text-xs text-muted-foreground" title={row.target_names ?? ""}>{row.scope}: {row.target_names || row.building_name || row.farm_name}</div></TableCell>
+                <TableCell><div className="font-medium">{row.medication_brand}</div><div className="text-xs text-muted-foreground">{row.medication_type} · {row.indication}</div></TableCell>
+                <TableCell className="whitespace-nowrap tabular-nums">{Number(row.dosage).toLocaleString()} {row.unit}</TableCell>
+                <TableCell className="whitespace-nowrap">{row.treatment_period_days} day{row.treatment_period_days === 1 ? "" : "s"}</TableCell>
+                <TableCell>{row.route}</TableCell>
+                <TableCell><span className={`rounded-full px-2 py-1 text-xs font-medium ${row.status === "Posted" ? "bg-emerald-100 text-emerald-700" : "bg-stone-200 text-stone-600"}`}>{row.status}</span></TableCell>
+                <TableCell>{row.createdByName}</TableCell>
+                <TableCell><span className="block max-w-40 truncate" title={row.assignedTaLabel}>{row.assignedTaLabel}</span></TableCell>
+                <TableCell><div className="flex justify-end gap-2"><Button type="button" size="sm" variant="outline" onClick={() => router.push(`/jmb/medication/new?id=${row.id}`)} className="border-emerald-700 text-emerald-700 hover:bg-emerald-50 hover:text-emerald-800"><Pencil className="size-4" />Edit/View</Button>{row.status === "Posted" ? <Button size="sm" variant="outline" className="text-red-600" onClick={() => { setCancelRecord(row); setCancelReason(""); }}><Ban className="size-4" />Cancel</Button> : null}</div></TableCell>
+              </TableRow>
+            ))}
+            {!loading && filtered.length === 0 ? <TableRow><TableCell colSpan={12} className="h-32 text-center text-muted-foreground">No medication records found.</TableCell></TableRow> : null}
+          </TableBody>
+        </Table>
+        <TablePagination page={currentPage} pageSize={pageSize} totalItems={filtered.length} itemLabel="records" onPageChange={setPage} />
+      </section>
+
+      <Dialog open={Boolean(cancelRecord)} onOpenChange={(open) => { if (!open && !cancelling) setCancelRecord(null); }}>
+        <DialogContent><DialogHeader><DialogTitle>Cancel medication record?</DialogTitle><DialogDescription>This preserves the record in history but marks it cancelled. Create a new record for corrections.</DialogDescription></DialogHeader><div className="space-y-2"><Label htmlFor="cancel-reason" required>Cancellation reason</Label><Textarea id="cancel-reason" value={cancelReason} onChange={(e) => setCancelReason(e.target.value)} placeholder="Why is this record being cancelled?" /></div><DialogFooter><Button variant="outline" onClick={() => setCancelRecord(null)} disabled={cancelling}>Keep record</Button><Button variant="destructive" onClick={() => void confirmCancel()} disabled={cancelling || !cancelReason.trim()}>{cancelling ? <Loader2 className="size-4 animate-spin" /> : <Ban className="size-4" />}Cancel record</Button></DialogFooter></DialogContent>
+      </Dialog>
+    </main>
+  );
+}

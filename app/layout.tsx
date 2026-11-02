@@ -10,9 +10,13 @@ import GlobalLoading from "@/loading";
 import { SidebarProvider } from "@/lib/sidebar/SidebarProvider";
 import AppSideBarControler from "@/lib/sidebar/AppSideBarControler";
 import { Toaster } from "sonner";
+import InternetErrorToast from '@/components/InternetErrorToast';
 import RouteGuard from '@/lib/SignupUpdateGuard';
 import GlobalLoaderController from '@/lib/context/GlobalLoaderController';
 import DefaultFarm from './utils/DefaultFarm';
+import CollapsedSidebarLabel from '@/lib/sidebar/CollapsedSidebarLabel';
+import { DesktopStatusBar } from '@/components/ui/DesktopStatusBar';
+import InactivityTimeoutGuard from '@/components/auth/InactivityTimeoutGuard';
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -25,7 +29,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "VitaHatchery",
+  title: "Vita FMS",
   description: "",
 };
 
@@ -35,13 +39,16 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html
+      lang="en"
+      suppressHydrationWarning
+      className="h-full overflow-hidden print:h-auto print:overflow-visible"
+    >
       <body
-        className={`  font-sans antialiased`}
+        className="h-full overflow-hidden font-sans antialiased print:h-auto print:overflow-visible"
       >
-        <NextTopLoader color="#2563eb" showSpinner={false} />
+        <NextTopLoader color="#00754A" showSpinner={false} />
         <GlobalProvider>
-          <RouteGuard />
           <GlobalLoaderController />
 
           <ThemeProvider
@@ -50,22 +57,26 @@ export default function RootLayout({
             enableSystem={false} // Prevents the OS from overriding your light default
             disableTransitionOnChange
           >
+            <InactivityTimeoutGuard />
             <ConfirmProvider>
               <FloatingDialogProvider>
                 {/* <GlobalLoading /> */}
 
                 <SidebarProvider>
-                  <div className="flex h-screen">
+                  <div className="flex h-dvh overflow-hidden bg-background print:h-auto print:overflow-visible">
                     <AppSideBarControler />
-                    <main className="flex-1 overflow-y-auto w-full ">
-                        {children}
+                    <main className="h-full min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto print:h-auto print:overflow-visible">
+                        <CollapsedSidebarLabel />
+                        <RouteGuard>{children}</RouteGuard>
                     </main>
                   </div>
+                  <DesktopStatusBar />
                 </SidebarProvider>
                 <DefaultFarm/>
               </FloatingDialogProvider>
 
             </ConfirmProvider>
+            <InternetErrorToast />
             <Toaster position='top-center' />
           </ThemeProvider>
         </GlobalProvider>
